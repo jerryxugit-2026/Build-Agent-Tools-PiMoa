@@ -1,6 +1,6 @@
 # Ai-learning
 
-Public learning and AI-tool projects by Jerry Xu.
+Public learning and AI-tool projects by Ziyang Xu.
 
 ## Projects
 
