@@ -1,0 +1,23 @@
+.DS_Store
+**/.DS_Store
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+target/
+**/target/
+
+.env
+.venv/
+venv/
+
+*.tmp
+*.log
+
+# Private Excel files should never be committed.
+*.xlsx
+*.xlsm
+*.xls
+external_samples/
