@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-label="Sheet Shadow principle diagram">
+  <rect width="1200" height="720" fill="#f7fbff"/>
+  <text x="600" y="58" text-anchor="middle" font-family="Arial, sans-serif" font-size="34" font-weight="700" fill="#12324a">Sheet Shadow: a safe shadow layer for AI + Excel</text>
+  <text x="600" y="92" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" fill="#4d6475">AI agents work on a controlled model first. The original workbook is patched only at the exact places that changed.</text>
+
+  <rect x="58" y="160" width="230" height="140" rx="18" fill="#ffffff" stroke="#2f80ed" stroke-width="3"/>
+  <text x="173" y="205" text-anchor="middle" font-family="Arial, sans-serif" font-size="24" font-weight="700" fill="#12324a">Real Excel</text>
+  <text x="173" y="238" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" fill="#4d6475">formulas, charts, images,</text>
+  <text x="173" y="262" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" fill="#4d6475">styles, pivots, hidden parts</text>
+
+  <path d="M300 230 L405 230" stroke="#2f80ed" stroke-width="4" fill="none" marker-end="url(#arrow)"/>
+  <text x="352" y="212" text-anchor="middle" font-family="Arial, sans-serif" font-size="15" fill="#2f80ed">ingest</text>
+
+  <rect x="420" y="135" width="360" height="190" rx="22" fill="#eaf4ff" stroke="#2f80ed" stroke-width="3"/>
+  <text x="600" y="178" text-anchor="middle" font-family="Arial, sans-serif" font-size="26" font-weight="700" fill="#12324a">WorkbookShadow</text>
+  <text x="600" y="214" text-anchor="middle" font-family="Arial, sans-serif" font-size="17" fill="#34556e">cells + formulas + objects</text>
+  <text x="600" y="241" text-anchor="middle" font-family="Arial, sans-serif" font-size="17" fill="#34556e">preview + audit + diagnostics</text>
+  <text x="600" y="268" text-anchor="middle" font-family="Arial, sans-serif" font-size="17" fill="#34556e">safe semantic operations</text>
+
+  <path d="M792 230 L902 230" stroke="#2f80ed" stroke-width="4" fill="none" marker-end="url(#arrow)"/>
+  <text x="847" y="212" text-anchor="middle" font-family="Arial, sans-serif" font-size="15" fill="#2f80ed">patch</text>
+
+  <rect x="920" y="160" width="230" height="140" rx="18" fill="#ffffff" stroke="#2f80ed" stroke-width="3"/>
+  <text x="1035" y="205" text-anchor="middle" font-family="Arial, sans-serif" font-size="24" font-weight="700" fill="#12324a">Saved Copy</text>
+  <text x="1035" y="238" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" fill="#4d6475">same workbook structure,</text>
+  <text x="1035" y="262" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" fill="#4d6475">only intended parts changed</text>
+
+  <rect x="160" y="425" width="240" height="145" rx="18" fill="#fff8e8" stroke="#f2a900" stroke-width="3"/>
+  <text x="280" y="468" text-anchor="middle" font-family="Arial, sans-serif" font-size="22" font-weight="700" fill="#573a00">Agent asks</text>
+  <text x="280" y="502" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" fill="#6a500f">"Change this formula"</text>
+  <text x="280" y="526" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" fill="#6a500f">"Move these rows"</text>
+  <text x="280" y="550" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" fill="#6a500f">"Replace this image"</text>
+
+  <path d="M410 498 L500 325" stroke="#f2a900" stroke-width="4" fill="none" marker-end="url(#arrowGold)"/>
+
+  <rect x="480" y="430" width="240" height="145" rx="18" fill="#edf8f1" stroke="#27ae60" stroke-width="3"/>
+  <text x="600" y="472" text-anchor="middle" font-family="Arial, sans-serif" font-size="22" font-weight="700" fill="#0f4c2a">Safety Gate</text>
+  <text x="600" y="506" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" fill="#285d3d">preview before write</text>
+  <text x="600" y="530" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" fill="#285d3d">diff after write</text>
+  <text x="600" y="554" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" fill="#285d3d">clear unsupported boundaries</text>
+
+  <path d="M600 425 L600 330" stroke="#27ae60" stroke-width="4" fill="none" marker-end="url(#arrowGreen)"/>
+
+  <rect x="800" y="425" width="240" height="145" rx="18" fill="#fff0f0" stroke="#eb5757" stroke-width="3"/>
+  <text x="920" y="468" text-anchor="middle" font-family="Arial, sans-serif" font-size="22" font-weight="700" fill="#6b1717">Avoids</text>
+  <text x="920" y="502" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" fill="#7a3030">broken workbook files</text>
+  <text x="920" y="526" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" fill="#7a3030">silent formula damage</text>
+  <text x="920" y="550" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" fill="#7a3030">raw XML guessing</text>
+
+  <path d="M805 498 L700 325" stroke="#eb5757" stroke-width="4" fill="none" marker-end="url(#arrowRed)"/>
+
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2 2 L10 6 L2 10 Z" fill="#2f80ed"/>
+    </marker>
+    <marker id="arrowGold" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2 2 L10 6 L2 10 Z" fill="#f2a900"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2 2 L10 6 L2 10 Z" fill="#27ae60"/>
+    </marker>
+    <marker id="arrowRed" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2 2 L10 6 L2 10 Z" fill="#eb5757"/>
+    </marker>
+  </defs>
+</svg>

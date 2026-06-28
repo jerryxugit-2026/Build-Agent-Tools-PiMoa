@@ -1,0 +1,22 @@
+[package]
+name = "sheet_shadow_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "sheet_shadow_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.26", features = ["extension-module"] }
+rusqlite = { version = "0.32", features = ["bundled", "vtab"] }
+calamine = "0.26"
+umya-spreadsheet = "2.2"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+roxmltree = "0.20"
+regex = "1.11"
+meval = "0.2"
+
+[package.metadata.maturin]
+name = "sheet_shadow_core"
+features = ["pyo3/extension-module"]
