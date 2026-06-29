@@ -10,12 +10,14 @@ use rusqlite::vtab::{
 use rusqlite::{params, Connection};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::marker::PhantomData;
 use std::os::raw::c_int;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
@@ -24,6 +26,13 @@ struct Key {
     sheet: String,
     row: usize,
     col: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceSnapshot {
+    len: u64,
+    modified_millis: u128,
+    package_manifest: Vec<String>,
 }
 
 #[pyclass]
@@ -51,6 +60,167 @@ impl CellCoord {
 struct FormulaCell {
     formula: String,
     deps: HashSet<Key>,
+    column_deps: HashSet<ColumnDependency>,
+    range_deps: HashSet<RangeDependency>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ColumnDependency {
+    sheet: String,
+    col: usize,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RangeDependency {
+    sheet: String,
+    start_row: usize,
+    end_row: usize,
+    start_col: usize,
+    end_col: usize,
+}
+
+#[derive(Clone, Debug)]
+struct RowBoundDependency {
+    start_row: usize,
+    end_row: usize,
+    formula_key: Key,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FormulaDeps {
+    cells: HashSet<Key>,
+    columns: HashSet<ColumnDependency>,
+    ranges: HashSet<RangeDependency>,
+}
+
+const BROAD_RANGE_COLUMN_DEP_CELL_THRESHOLD: usize = 256;
+
+#[derive(Clone, Debug)]
+struct FormulaResult {
+    value: String,
+    spill: Option<Vec<Vec<String>>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DependencyCellIndex {
+    by_sheet_col: HashMap<String, HashMap<usize, Vec<Key>>>,
+}
+
+impl DependencyCellIndex {
+    fn from_cells(cells: &HashMap<Key, String>) -> Self {
+        let mut index = DependencyCellIndex::default();
+        for key in cells.keys() {
+            index
+                .by_sheet_col
+                .entry(key.sheet.clone())
+                .or_default()
+                .entry(key.col)
+                .or_default()
+                .push(key.clone());
+        }
+        index
+    }
+
+    fn column(&self, sheet: &str, col: usize) -> Option<&[Key]> {
+        self.by_sheet_col
+            .get(sheet)
+            .and_then(|cols| cols.get(&col))
+            .map(Vec::as_slice)
+    }
+
+    fn range(&self, range: &RangeDependency) -> Vec<Key> {
+        let mut keys = Vec::new();
+        for col in range.start_col..=range.end_col {
+            if let Some(column_keys) = self.column(&range.sheet, col) {
+                keys.extend(
+                    column_keys
+                        .iter()
+                        .filter(|key| key.row >= range.start_row && key.row <= range.end_row)
+                        .cloned(),
+                );
+            }
+        }
+        keys
+    }
+}
+
+fn expand_column_dependencies(
+    deps: &mut HashSet<Key>,
+    column_deps: &HashSet<ColumnDependency>,
+    cell_index: &DependencyCellIndex,
+) {
+    for dep in column_deps {
+        if let Some(keys) = cell_index.column(&dep.sheet, dep.col) {
+            deps.extend(keys.iter().cloned());
+        }
+    }
+}
+
+fn expand_range_dependencies(
+    deps: &mut HashSet<Key>,
+    range_deps: &HashSet<RangeDependency>,
+    cell_index: &DependencyCellIndex,
+) {
+    for dep in range_deps {
+        deps.extend(cell_index.range(dep));
+    }
+}
+
+fn expanded_dependency_count(
+    deps: &HashSet<Key>,
+    column_deps: &HashSet<ColumnDependency>,
+    range_deps: &HashSet<RangeDependency>,
+    cell_index: &DependencyCellIndex,
+) -> usize {
+    let mut expanded = deps.clone();
+    expand_column_dependencies(&mut expanded, column_deps, cell_index);
+    expand_range_dependencies(&mut expanded, range_deps, cell_index);
+    expanded.len()
+}
+
+fn formula_references_key(formula: &FormulaCell, key: &Key) -> bool {
+    formula.deps.contains(key)
+        || formula.column_deps.contains(&ColumnDependency {
+            sheet: key.sheet.clone(),
+            col: key.col,
+        })
+        || formula.range_deps.iter().any(|range| {
+            range.sheet == key.sheet
+                && key.row >= range.start_row
+                && key.row <= range.end_row
+                && key.col >= range.start_col
+                && key.col <= range.end_col
+        })
+}
+
+fn enqueue_dependents_for_key(
+    dependents: &HashMap<Key, HashSet<Key>>,
+    column_dependents: &HashMap<ColumnDependency, HashSet<Key>>,
+    range_dependents: &HashMap<ColumnDependency, Vec<RowBoundDependency>>,
+    source_key: &Key,
+    queue: &mut VecDeque<Key>,
+) {
+    if let Some(next) = dependents.get(source_key) {
+        for dep in next {
+            queue.push_back(dep.clone());
+        }
+    }
+    let column_dep = ColumnDependency {
+        sheet: source_key.sheet.clone(),
+        col: source_key.col,
+    };
+    if let Some(next) = column_dependents.get(&column_dep) {
+        for dep in next {
+            queue.push_back(dep.clone());
+        }
+    }
+    if let Some(next) = range_dependents.get(&column_dep) {
+        for dep in next {
+            if source_key.row >= dep.start_row && source_key.row <= dep.end_row {
+                queue.push_back(dep.formula_key.clone());
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -663,6 +833,7 @@ impl FormulaBackend for RustMvpFormulaBackend {
 #[derive(Clone)]
 struct SheetShadowEngine {
     source_path: Option<PathBuf>,
+    source_snapshot: Option<SourceSnapshot>,
     sheets: Vec<SheetInfo>,
     defined_names: Vec<DefinedName>,
     tables: Vec<TableInfo>,
@@ -694,8 +865,12 @@ struct SheetShadowEngine {
     workbook_dirty: bool,
     cells: HashMap<Key, String>,
     formulas: HashMap<Key, FormulaCell>,
+    spill_anchors: HashMap<Key, Vec<Key>>,
+    spill_children: HashMap<Key, Key>,
     meta: HashMap<Key, ShadowMetaRecord>,
     dependents: HashMap<Key, HashSet<Key>>,
+    column_dependents: HashMap<ColumnDependency, HashSet<Key>>,
+    range_dependents: HashMap<ColumnDependency, Vec<RowBoundDependency>>,
     dirty: HashSet<Key>,
     modified: HashSet<Key>,
     audit_events: Vec<AuditEvent>,
@@ -707,6 +882,7 @@ impl SheetShadowEngine {
     fn new() -> Self {
         Self {
             source_path: None,
+            source_snapshot: None,
             sheets: Vec::new(),
             defined_names: Vec::new(),
             tables: Vec::new(),
@@ -738,8 +914,12 @@ impl SheetShadowEngine {
             workbook_dirty: false,
             cells: HashMap::new(),
             formulas: HashMap::new(),
+            spill_anchors: HashMap::new(),
+            spill_children: HashMap::new(),
             meta: HashMap::new(),
             dependents: HashMap::new(),
+            column_dependents: HashMap::new(),
+            range_dependents: HashMap::new(),
             dirty: HashSet::new(),
             modified: HashSet::new(),
             audit_events: Vec::new(),
@@ -747,7 +927,17 @@ impl SheetShadowEngine {
     }
 
     fn ingest(&mut self, file_path: &str) -> PyResult<()> {
+        let profile = ingest_profile_enabled();
+        let profile_total_start = Instant::now();
+        let mut profile_step_start = profile_total_start;
         self.source_path = Some(PathBuf::from(file_path));
+        self.source_snapshot = Some(source_snapshot_for_path(file_path)?);
+        log_ingest_profile(
+            profile,
+            "source_snapshot",
+            &mut profile_step_start,
+            profile_total_start,
+        );
         self.sheets.clear();
         self.defined_names.clear();
         self.tables.clear();
@@ -779,25 +969,101 @@ impl SheetShadowEngine {
         self.workbook_dirty = false;
         self.cells.clear();
         self.formulas.clear();
+        self.spill_anchors.clear();
+        self.spill_children.clear();
         self.meta.clear();
         self.dependents.clear();
+        self.column_dependents.clear();
+        self.range_dependents.clear();
         self.dirty.clear();
         self.modified.clear();
         self.audit_events.clear();
+        log_ingest_profile(
+            profile,
+            "clear_runtime_state",
+            &mut profile_step_start,
+            profile_total_start,
+        );
 
         let mut archive = open_zip(file_path)?;
+        log_ingest_profile(
+            profile,
+            "open_zip",
+            &mut profile_step_start,
+            profile_total_start,
+        );
         let package_entries = zip_entry_names(&mut archive)?;
+        log_ingest_profile(
+            profile,
+            "zip_entry_names",
+            &mut profile_step_start,
+            profile_total_start,
+        );
         let package_sizes = zip_entry_sizes(&mut archive)?;
+        log_ingest_profile(
+            profile,
+            "zip_entry_sizes",
+            &mut profile_step_start,
+            profile_total_start,
+        );
         let shared_strings = read_shared_strings(&mut archive)?;
+        log_ingest_profile(
+            profile,
+            "shared_strings",
+            &mut profile_step_start,
+            profile_total_start,
+        );
         let style_info = read_style_info(&mut archive)?;
+        log_ingest_profile(
+            profile,
+            "style_info",
+            &mut profile_step_start,
+            profile_total_start,
+        );
         self.style_count = style_info.len() as u32;
         let sheets = read_workbook_sheets(&mut archive)?;
+        log_ingest_profile(
+            profile,
+            "workbook_sheets",
+            &mut profile_step_start,
+            profile_total_start,
+        );
         let defined_names = read_defined_names(&mut archive, &sheets)?;
+        log_ingest_profile(
+            profile,
+            "defined_names",
+            &mut profile_step_start,
+            profile_total_start,
+        );
         let tables = read_table_info(&mut archive, &sheets)?;
+        log_ingest_profile(
+            profile,
+            "table_info",
+            &mut profile_step_start,
+            profile_total_start,
+        );
         let comments = read_comments(&mut archive, &sheets)?;
+        log_ingest_profile(
+            profile,
+            "comments",
+            &mut profile_step_start,
+            profile_total_start,
+        );
         let drawing_objects = read_drawing_objects(&mut archive, &sheets, &package_entries)?;
+        log_ingest_profile(
+            profile,
+            "drawing_objects",
+            &mut profile_step_start,
+            profile_total_start,
+        );
         let high_risk_objects =
             read_high_risk_objects(&mut archive, &sheets, &package_entries, &package_sizes)?;
+        log_ingest_profile(
+            profile,
+            "high_risk_objects",
+            &mut profile_step_start,
+            profile_total_start,
+        );
 
         for sheet in &sheets {
             let xml = read_zip_text(&mut archive, &sheet.path)?;
@@ -819,6 +1085,12 @@ impl SheetShadowEngine {
                 &mut self.meta,
             )?;
         }
+        log_ingest_profile(
+            profile,
+            "worksheet_parse",
+            &mut profile_step_start,
+            profile_total_start,
+        );
 
         self.sheets = sheets;
         self.defined_names = defined_names;
@@ -827,7 +1099,19 @@ impl SheetShadowEngine {
         self.drawing_objects = drawing_objects;
         self.high_risk_objects = high_risk_objects;
         self.rebuild_formula_deps();
+        log_ingest_profile(
+            profile,
+            "formula_deps",
+            &mut profile_step_start,
+            profile_total_start,
+        );
         self.rebuild_dependents();
+        log_ingest_profile(
+            profile,
+            "dependents",
+            &mut profile_step_start,
+            profile_total_start,
+        );
         Ok(())
     }
 
@@ -1793,6 +2077,7 @@ impl SheetShadowEngine {
     }
 
     fn workbook_status(&self) -> HashMap<String, String> {
+        let (source_snapshot_state, source_snapshot_detail) = self.source_snapshot_state();
         HashMap::from([
             (
                 "source_path".to_string(),
@@ -1801,6 +2086,15 @@ impl SheetShadowEngine {
                     .map(|path| path.to_string_lossy().to_string())
                     .unwrap_or_default(),
             ),
+            (
+                "source_snapshot_state".to_string(),
+                source_snapshot_state.clone(),
+            ),
+            (
+                "source_snapshot_fresh".to_string(),
+                (source_snapshot_state == "fresh").to_string(),
+            ),
+            ("source_snapshot_detail".to_string(), source_snapshot_detail),
             ("sheet_count".to_string(), self.sheets.len().to_string()),
             ("meta_count".to_string(), self.meta.len().to_string()),
             (
@@ -1925,13 +2219,15 @@ impl SheetShadowEngine {
             FormulaCell {
                 formula: normalized_formula.clone(),
                 deps: HashSet::new(),
+                column_deps: HashSet::new(),
+                range_deps: HashSet::new(),
             },
         );
         self.rebuild_formula_deps();
         if self
             .formulas
             .get(&key)
-            .map(|formula| formula.deps.contains(&key))
+            .map(|formula| formula_references_key(formula, &key))
             .unwrap_or(false)
         {
             return Err(PyValueError::new_err(
@@ -1940,8 +2236,11 @@ impl SheetShadowEngine {
         }
         self.rebuild_dependents();
 
-        let new_value = self.evaluate_formula_cell(&key)?;
+        let result = self.evaluate_formula_result(&key)?;
+        self.validate_spill_result(&key, result.spill.as_ref())?;
+        let new_value = result.value.clone();
         self.cells.insert(key.clone(), new_value.clone());
+        let spill_impacted = self.apply_spill_result(&key, result.spill.as_ref(), reason)?;
         self.modified.insert(key.clone());
 
         let meta = self.ensure_meta_record(&key);
@@ -1967,6 +2266,7 @@ impl SheetShadowEngine {
             row: key.row,
             col: key.col,
         }];
+        impacted.extend(spill_impacted);
         impacted.extend(self.recalculate_dependents_from(&key.sheet, key.row, key.col)?);
         Ok(impacted)
     }
@@ -2180,11 +2480,13 @@ impl SheetShadowEngine {
         let mut queue = VecDeque::new();
         let mut seen = HashSet::new();
 
-        if let Some(next) = self.dependents.get(&source_key) {
-            for dep in next {
-                queue.push_back(dep.clone());
-            }
-        }
+        enqueue_dependents_for_key(
+            &self.dependents,
+            &self.column_dependents,
+            &self.range_dependents,
+            &source_key,
+            &mut queue,
+        );
 
         while let Some(formula_key) = queue.pop_front() {
             if !seen.insert(formula_key.clone()) {
@@ -2192,7 +2494,11 @@ impl SheetShadowEngine {
             }
 
             let old_value = self.cells.get(&formula_key).cloned().unwrap_or_default();
-            let new_value = self.evaluate_formula_cell(&formula_key)?;
+            let result = self.evaluate_formula_result(&formula_key)?;
+            self.validate_spill_result(&formula_key, result.spill.as_ref())?;
+            let new_value = result.value.clone();
+            let spill_impacted =
+                self.apply_spill_result(&formula_key, result.spill.as_ref(), "formula_recalc")?;
             if normalized_number(&old_value) != normalized_number(&new_value) {
                 self.cells.insert(formula_key.clone(), new_value);
                 self.dirty.insert(formula_key.clone());
@@ -2225,13 +2531,19 @@ impl SheetShadowEngine {
                     row: formula_key.row,
                     col: formula_key.col,
                 });
+                changed.extend(spill_impacted);
 
-                if let Some(next) = self.dependents.get(&formula_key) {
-                    let downstream: Vec<Key> = next.iter().cloned().collect();
-                    for dep in downstream {
-                        seen.remove(&dep);
-                        queue.push_back(dep);
-                    }
+                let mut downstream = VecDeque::new();
+                enqueue_dependents_for_key(
+                    &self.dependents,
+                    &self.column_dependents,
+                    &self.range_dependents,
+                    &formula_key,
+                    &mut downstream,
+                );
+                while let Some(dep) = downstream.pop_front() {
+                    seen.remove(&dep);
+                    queue.push_back(dep);
                 }
             }
         }
@@ -2275,8 +2587,11 @@ impl SheetShadowEngine {
             .formulas
             .get(&key)
             .ok_or_else(|| PyValueError::new_err("formula cell not found"))?;
-        let mut deps: Vec<CellCoord> = formula
-            .deps
+        let cell_index = DependencyCellIndex::from_cells(&self.cells);
+        let mut expanded_deps = formula.deps.clone();
+        expand_column_dependencies(&mut expanded_deps, &formula.column_deps, &cell_index);
+        expand_range_dependencies(&mut expanded_deps, &formula.range_deps, &cell_index);
+        let mut deps: Vec<CellCoord> = expanded_deps
             .iter()
             .map(|dep| CellCoord {
                 sheet: dep.sheet.clone(),
@@ -2477,6 +2792,7 @@ impl SheetShadowEngine {
             .source_path
             .as_ref()
             .ok_or_else(|| PyValueError::new_err("ingest() must be called before save()"))?;
+        self.ensure_source_snapshot_fresh()?;
         let shared_string_policy = parse_shared_string_policy(shared_string_policy)?;
         let shared_string_plan =
             self.build_shared_string_patch_plan(source_path, shared_string_policy)?;
@@ -2675,6 +2991,44 @@ impl SheetShadowEngine {
 }
 
 impl SheetShadowEngine {
+    fn source_snapshot_state(&self) -> (String, String) {
+        let Some(source_path) = self.source_path.as_ref() else {
+            return (
+                "unknown".to_string(),
+                "ingest() has not recorded a source path".to_string(),
+            );
+        };
+        let Some(ingest_snapshot) = self.source_snapshot.as_ref() else {
+            return (
+                "unknown".to_string(),
+                "ingest() has not recorded a source snapshot".to_string(),
+            );
+        };
+        let source_path_str = source_path.to_string_lossy();
+        match source_snapshot_for_path(&source_path_str) {
+            Ok(current_snapshot) if &current_snapshot == ingest_snapshot => (
+                "fresh".to_string(),
+                "source workbook matches ingest-time package snapshot".to_string(),
+            ),
+            Ok(_) => (
+                "stale".to_string(),
+                "source workbook changed after ingest; re-ingest before save".to_string(),
+            ),
+            Err(err) => (
+                "stale".to_string(),
+                format!("source workbook could not be re-read after ingest: {err}"),
+            ),
+        }
+    }
+
+    fn ensure_source_snapshot_fresh(&self) -> PyResult<()> {
+        let (state, detail) = self.source_snapshot_state();
+        if state == "fresh" {
+            return Ok(());
+        }
+        Err(PyValueError::new_err(format!("stale_session: {detail}")))
+    }
+
     fn apply_structure_edit_with_reason(
         &mut self,
         sheet: &str,
@@ -4238,6 +4592,148 @@ impl SheetShadowEngine {
             })
     }
 
+    fn validate_spill_result(
+        &self,
+        anchor: &Key,
+        spill: Option<&Vec<Vec<String>>>,
+    ) -> PyResult<()> {
+        let Some(matrix) = spill else {
+            return Ok(());
+        };
+        for (row_offset, row_values) in matrix.iter().enumerate() {
+            for (col_offset, _) in row_values.iter().enumerate() {
+                if row_offset == 0 && col_offset == 0 {
+                    continue;
+                }
+                let key = Key {
+                    sheet: anchor.sheet.clone(),
+                    row: anchor.row + row_offset,
+                    col: anchor.col + col_offset,
+                };
+                if self.spill_children.get(&key) == Some(anchor) {
+                    continue;
+                }
+                if self.cells.get(&key).is_some_and(|value| !value.is_empty()) {
+                    return Err(PyValueError::new_err(format!(
+                        "unsupported_formula: spill range is blocked at {}!{}{}",
+                        key.sheet,
+                        col_to_name(key.col),
+                        key.row
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_spill_result(
+        &mut self,
+        anchor: &Key,
+        spill: Option<&Vec<Vec<String>>>,
+        reason: &str,
+    ) -> PyResult<Vec<CellCoord>> {
+        let mut changed = self.clear_spill_children(anchor, reason);
+        let Some(matrix) = spill else {
+            return Ok(changed);
+        };
+        let mut next_children = Vec::new();
+        for (row_offset, row_values) in matrix.iter().enumerate() {
+            for (col_offset, value) in row_values.iter().enumerate() {
+                if row_offset == 0 && col_offset == 0 {
+                    continue;
+                }
+                let key = Key {
+                    sheet: anchor.sheet.clone(),
+                    row: anchor.row + row_offset,
+                    col: anchor.col + col_offset,
+                };
+                next_children.push(key.clone());
+                let old_value = self.cells.get(&key).cloned().unwrap_or_default();
+                if normalized_number(&old_value) == normalized_number(value) {
+                    self.spill_children.insert(key.clone(), anchor.clone());
+                    continue;
+                }
+                self.cells.insert(key.clone(), value.clone());
+                self.dirty.insert(key.clone());
+                let meta = self.ensure_meta_record(&key);
+                meta.cell_type = "spill".to_string();
+                meta.original_formula = format!(
+                    "spill_from:{}!{}{}",
+                    anchor.sheet,
+                    col_to_name(anchor.col),
+                    anchor.row
+                );
+                meta.cached_value_before = old_value.clone();
+                meta.cached_value_after = value.clone();
+                meta.is_dirty = true;
+                self.audit_events.push(AuditEvent {
+                    event_type: "formula_spill_write".to_string(),
+                    sheet: key.sheet.clone(),
+                    row: key.row,
+                    col: key.col,
+                    old_value,
+                    new_value: value.clone(),
+                    formula: self
+                        .formulas
+                        .get(anchor)
+                        .map(|cell| cell.formula.clone())
+                        .unwrap_or_default(),
+                    reason: reason.to_string(),
+                });
+                self.spill_children.insert(key.clone(), anchor.clone());
+                changed.push(CellCoord {
+                    sheet: key.sheet.clone(),
+                    row: key.row,
+                    col: key.col,
+                });
+            }
+        }
+        if next_children.is_empty() {
+            self.spill_anchors.remove(anchor);
+        } else {
+            self.spill_anchors.insert(anchor.clone(), next_children);
+        }
+        Ok(changed)
+    }
+
+    fn clear_spill_children(&mut self, anchor: &Key, reason: &str) -> Vec<CellCoord> {
+        let old_children = self.spill_anchors.remove(anchor).unwrap_or_default();
+        let mut changed = Vec::new();
+        for key in old_children {
+            self.spill_children.remove(&key);
+            let old_value = self.cells.get(&key).cloned().unwrap_or_default();
+            if old_value.is_empty() {
+                continue;
+            }
+            self.cells.insert(key.clone(), String::new());
+            self.dirty.insert(key.clone());
+            let meta = self.ensure_meta_record(&key);
+            meta.cached_value_before = old_value.clone();
+            meta.cached_value_after = String::new();
+            meta.is_dirty = true;
+            self.audit_events.push(AuditEvent {
+                event_type: "formula_spill_clear".to_string(),
+                sheet: key.sheet.clone(),
+                row: key.row,
+                col: key.col,
+                old_value,
+                new_value: String::new(),
+                formula: self
+                    .formulas
+                    .get(anchor)
+                    .map(|cell| cell.formula.clone())
+                    .unwrap_or_default(),
+                reason: reason.to_string(),
+            });
+            changed.push(CellCoord {
+                sheet: key.sheet.clone(),
+                row: key.row,
+                col: key.col,
+            });
+        }
+        changed
+    }
+
     fn rebuild_formula_deps(&mut self) {
         let sheet_order: Vec<String> = self.sheets.iter().map(|sheet| sheet.name.clone()).collect();
         let formula_keys: HashSet<Key> = self.formulas.keys().cloned().collect();
@@ -4249,7 +4745,7 @@ impl SheetShadowEngine {
 
         for (key, formula_text) in formulas {
             if let Some(formula) = self.formulas.get_mut(&key) {
-                formula.deps = extract_deps(
+                let deps = extract_deps(
                     &formula_text,
                     &key,
                     &self.cells,
@@ -4258,12 +4754,17 @@ impl SheetShadowEngine {
                     &formula_keys,
                     &self.tables,
                 );
+                formula.deps = deps.cells;
+                formula.column_deps = deps.columns;
+                formula.range_deps = deps.ranges;
             }
         }
     }
 
     fn rebuild_dependents(&mut self) {
         self.dependents.clear();
+        self.column_dependents.clear();
+        self.range_dependents.clear();
         for (formula_key, formula) in &self.formulas {
             for dep in &formula.deps {
                 self.dependents
@@ -4271,16 +4772,58 @@ impl SheetShadowEngine {
                     .or_default()
                     .insert(formula_key.clone());
             }
+            for dep in &formula.column_deps {
+                self.column_dependents
+                    .entry(dep.clone())
+                    .or_default()
+                    .insert(formula_key.clone());
+            }
+            for dep in &formula.range_deps {
+                for col in dep.start_col..=dep.end_col {
+                    self.range_dependents
+                        .entry(ColumnDependency {
+                            sheet: dep.sheet.clone(),
+                            col,
+                        })
+                        .or_default()
+                        .push(RowBoundDependency {
+                            start_row: dep.start_row,
+                            end_row: dep.end_row,
+                            formula_key: formula_key.clone(),
+                        });
+                }
+            }
         }
     }
 
-    fn evaluate_formula_cell(&self, key: &Key) -> PyResult<String> {
+    fn evaluate_formula_result(&self, key: &Key) -> PyResult<FormulaResult> {
         let formula = self
             .formulas
             .get(key)
             .ok_or_else(|| PyValueError::new_err("formula cell not found"))?;
+        let eval_formula = self.formula_for_evaluation(key, &formula.formula)?;
         let backend = RustMvpFormulaBackend;
-        backend.evaluate_formula(&formula.formula, &key.sheet, &self.cells)
+        let spill = evaluate_formula_spill_matrix(&eval_formula, &key.sheet, &self.cells)?;
+        let value = if let Some(matrix) = spill.as_ref() {
+            matrix
+                .first()
+                .and_then(|row| row.first())
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            backend.evaluate_formula(&eval_formula, &key.sheet, &self.cells)?
+        };
+        Ok(FormulaResult { value, spill })
+    }
+
+    fn evaluate_formula_cell(&self, key: &Key) -> PyResult<String> {
+        Ok(self.evaluate_formula_result(key)?.value)
+    }
+
+    fn formula_for_evaluation(&self, key: &Key, formula: &str) -> PyResult<String> {
+        let with_names =
+            resolve_defined_names_in_formula(formula, &key.sheet, &self.defined_names)?;
+        resolve_structured_refs_in_formula(&with_names, key, &self.tables)
     }
 
     fn sheet_table_map(&self) -> HashMap<String, String> {
@@ -4666,11 +5209,15 @@ impl SheetShadowEngine {
 
         let mut formulas: Vec<(&Key, &FormulaCell)> = self.formulas.iter().collect();
         formulas.sort_by_key(|(key, _)| (key.sheet.clone(), key.row, key.col));
+        let cell_index = DependencyCellIndex::from_cells(&self.cells);
         for (formula_key, formula) in formulas {
             let formula_id = graph_cell_id(formula_key);
             insert_graph_node(&tx, "formula", &formula_id, &formula.formula)?;
             insert_graph_edge(&tx, "cell", &formula_id, "formula", &formula_id, "contains")?;
-            let mut deps: Vec<&Key> = formula.deps.iter().collect();
+            let mut expanded_deps = formula.deps.clone();
+            expand_column_dependencies(&mut expanded_deps, &formula.column_deps, &cell_index);
+            expand_range_dependencies(&mut expanded_deps, &formula.range_deps, &cell_index);
+            let mut deps: Vec<Key> = expanded_deps.into_iter().collect();
             deps.sort_by_key(|key| (key.sheet.clone(), key.row, key.col));
             for dep in deps {
                 tx.execute(
@@ -4693,7 +5240,7 @@ impl SheetShadowEngine {
                     "formula",
                     &formula_id,
                     "cell",
-                    &graph_cell_id(dep),
+                    &graph_cell_id(&dep),
                     "depends_on",
                 )?;
             }
@@ -4719,6 +5266,55 @@ impl SheetShadowEngine {
 fn open_zip(file_path: &str) -> PyResult<ZipArchive<File>> {
     let file = File::open(file_path).map_err(to_py_runtime)?;
     ZipArchive::new(file).map_err(to_py_runtime)
+}
+
+fn source_snapshot_for_path(file_path: &str) -> PyResult<SourceSnapshot> {
+    let metadata = fs::metadata(file_path).map_err(to_py_runtime)?;
+    let modified = metadata.modified().map_err(to_py_runtime)?;
+    let modified_millis = modified
+        .duration_since(UNIX_EPOCH)
+        .map_err(to_py_runtime)?
+        .as_millis();
+    let mut archive = open_zip(file_path)?;
+    let mut package_manifest = Vec::new();
+    for i in 0..archive.len() {
+        let entry = archive.by_index(i).map_err(to_py_runtime)?;
+        package_manifest.push(format!(
+            "{}:{}:{}:{}",
+            entry.name(),
+            entry.size(),
+            entry.compressed_size(),
+            entry.crc32()
+        ));
+    }
+    package_manifest.sort();
+    Ok(SourceSnapshot {
+        len: metadata.len(),
+        modified_millis,
+        package_manifest,
+    })
+}
+
+fn ingest_profile_enabled() -> bool {
+    std::env::var("SHEET_SHADOW_INGEST_PROFILE").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn log_ingest_profile(enabled: bool, step: &str, step_start: &mut Instant, total_start: Instant) {
+    if !enabled {
+        return;
+    }
+    let now = Instant::now();
+    eprintln!(
+        "sheet_shadow_ingest_profile step={step} seconds={:.6} total_seconds={:.6}",
+        now.duration_since(*step_start).as_secs_f64(),
+        now.duration_since(total_start).as_secs_f64()
+    );
+    *step_start = now;
 }
 
 fn read_zip_text<R: Read + std::io::Seek>(
@@ -5842,6 +6438,12 @@ fn parse_sheet_objects(
     auto_filters: &mut Vec<AutoFilterRule>,
     conditional_formats: &mut Vec<ConditionalFormatRule>,
 ) -> PyResult<()> {
+    if !xml.contains("dataValidation")
+        && !xml.contains("autoFilter")
+        && !xml.contains("conditionalFormatting")
+    {
+        return Ok(());
+    }
     let doc = Document::parse(xml).map_err(to_py_runtime)?;
     for node in doc
         .descendants()
@@ -6047,6 +6649,11 @@ fn parse_sheet_xml(
     meta: &mut HashMap<Key, ShadowMetaRecord>,
 ) -> PyResult<()> {
     let doc = Document::parse(xml).map_err(to_py_runtime)?;
+    let approx_cell_count = xml.matches("<c ").count() + xml.matches(":c ").count();
+    let approx_formula_count = xml.matches("<f").count() + xml.matches(":f").count();
+    cells.reserve(approx_cell_count);
+    meta.reserve(approx_cell_count);
+    formulas.reserve(approx_formula_count);
 
     for merge_cell in doc
         .descendants()
@@ -6079,16 +6686,7 @@ fn parse_sheet_xml(
         let style_id = node
             .attribute("s")
             .and_then(|value| value.parse::<u32>().ok());
-        let formula = child_text(node, "f");
-        let raw_value = child_text(node, "v");
-        let mut inline_value = String::new();
-        for child in node
-            .descendants()
-            .filter(|child| child.tag_name().name() == "t")
-        {
-            inline_value.push_str(child.text().unwrap_or(""));
-        }
-
+        let (formula, raw_value, inline_value) = cell_text_parts(node, cell_type);
         let value = match cell_type {
             "s" => raw_value
                 .parse::<usize>()
@@ -6098,6 +6696,7 @@ fn parse_sheet_xml(
             "inlineStr" => inline_value,
             _ => raw_value.clone(),
         };
+        let cached_value = value.clone();
         cells.insert(key.clone(), value);
         let shadow_cell_type = classify_cell_type(cell_type, &formula, &raw_value);
         meta.insert(
@@ -6118,8 +6717,8 @@ fn parse_sheet_xml(
                 } else {
                     format!("={formula}")
                 },
-                cached_value_before: cells.get(&key).cloned().unwrap_or_default(),
-                cached_value_after: cells.get(&key).cloned().unwrap_or_default(),
+                cached_value_before: cached_value.clone(),
+                cached_value_after: cached_value,
                 merge_range: String::new(),
                 is_modified: false,
                 is_dirty: false,
@@ -6136,12 +6735,39 @@ fn parse_sheet_xml(
                         format!("={}", formula)
                     },
                     deps: HashSet::new(),
+                    column_deps: HashSet::new(),
+                    range_deps: HashSet::new(),
                 },
             );
         }
     }
 
     Ok(())
+}
+
+fn cell_text_parts(node: roxmltree::Node<'_, '_>, cell_type: &str) -> (String, String, String) {
+    let mut formula = String::new();
+    let mut raw_value = String::new();
+    let mut inline_value = String::new();
+    let read_inline = cell_type == "inlineStr";
+
+    for child in node.children().filter(|child| child.is_element()) {
+        match child.tag_name().name() {
+            "f" => formula = child.text().unwrap_or("").to_string(),
+            "v" => raw_value = child.text().unwrap_or("").to_string(),
+            "is" if read_inline => {
+                for text_node in child
+                    .descendants()
+                    .filter(|item| item.is_element() && item.tag_name().name() == "t")
+                {
+                    inline_value.push_str(text_node.text().unwrap_or(""));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (formula, raw_value, inline_value)
 }
 
 fn classify_cell_type(cell_type: &str, formula: &str, raw_value: &str) -> String {
@@ -6804,10 +7430,14 @@ fn display_cell_value(canonical_value: &str, semantic_type: &str) -> String {
 
 fn excel_serial_to_date(raw_value: &str) -> Option<String> {
     let serial = raw_value.parse::<f64>().ok()?.floor() as i64;
+    let (year, month, day) = ymd_from_excel_serial(serial)?;
+    Some(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+fn ymd_from_excel_serial(serial: i64) -> Option<(i32, i32, i32)> {
     if serial < 1 {
         return None;
     }
-
     let mut year = 1900;
     let mut month = 1;
     let mut day = 1;
@@ -6829,7 +7459,90 @@ fn excel_serial_to_date(raw_value: &str) -> Option<String> {
         remaining -= 1;
     }
 
-    Some(format!("{year:04}-{month:02}-{day:02}"))
+    Some((year, month, day))
+}
+
+fn excel_serial_from_ymd(year: i32, month: i32, day: i32) -> i64 {
+    let mut serial = 1i64;
+    let mut y = 1900;
+    let mut m = 1;
+    let mut d = 1;
+    while (y, m, d) < (year, month, day) {
+        d += 1;
+        if d > days_in_month(y, m) {
+            d = 1;
+            m += 1;
+            if m > 12 {
+                m = 1;
+                y += 1;
+            }
+        }
+        serial += 1;
+    }
+    if (year, month, day) >= (1900, 3, 1) {
+        serial += 1;
+    }
+    serial
+}
+
+fn normalize_ymd(year: i32, month: i32, day: i32) -> (i32, i32, i32) {
+    let mut year = year;
+    let mut month = month;
+    while month < 1 {
+        month += 12;
+        year -= 1;
+    }
+    while month > 12 {
+        month -= 12;
+        year += 1;
+    }
+    let mut day = day;
+    while day < 1 {
+        month -= 1;
+        if month < 1 {
+            month = 12;
+            year -= 1;
+        }
+        day += days_in_month(year, month);
+    }
+    while day > days_in_month(year, month) {
+        day -= days_in_month(year, month);
+        month += 1;
+        if month > 12 {
+            month = 1;
+            year += 1;
+        }
+    }
+    (year, month, day)
+}
+
+fn add_months(year: i32, month: i32, months: i32) -> (i32, i32) {
+    let zero_based = year * 12 + (month - 1) + months;
+    (zero_based.div_euclid(12), zero_based.rem_euclid(12) + 1)
+}
+
+fn today_excel_serial() -> PyResult<f64> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(to_py_runtime)?;
+    let days_since_unix_epoch = (now.as_secs() / 86_400) as i64;
+    Ok((excel_serial_from_ymd(1970, 1, 1) + days_since_unix_epoch) as f64)
+}
+
+fn now_excel_serial() -> PyResult<f64> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(to_py_runtime)?;
+    let days = (now.as_secs() / 86_400) as i64;
+    let seconds_today = (now.as_secs() % 86_400) as f64;
+    Ok((excel_serial_from_ymd(1970, 1, 1) + days) as f64 + seconds_today / 86_400.0)
+}
+
+fn volatile_fraction() -> PyResult<f64> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(to_py_runtime)?;
+    Ok((now.subsec_nanos() as f64 / 1_000_000_000.0).clamp(0.0, 0.999999999))
 }
 
 fn days_in_month(year: i32, month: i32) -> i32 {
@@ -7313,21 +8026,17 @@ fn extract_deps(
     defined_names: &[DefinedName],
     formula_keys: &HashSet<Key>,
     tables: &[TableInfo],
-) -> HashSet<Key> {
+) -> FormulaDeps {
     let literal_stripped = strip_formula_string_literals(formula);
     let structured_deps =
         structured_table_ref_deps(&literal_stripped, formula_key, cells, formula_keys, tables);
     let scanned = mask_unsupported_dependency_tokens(&literal_stripped);
-    let (defined_deps, scanned) = extract_defined_name_deps(
-        &scanned,
-        &formula_key.sheet,
-        cells,
-        sheet_order,
-        defined_names,
-    );
-    let mut deps = extract_deps_regex(&scanned, &formula_key.sheet, cells, sheet_order);
-    deps.extend(defined_deps);
-    deps.extend(structured_deps);
+    let (defined_deps, scanned) =
+        extract_defined_name_deps(&scanned, &formula_key.sheet, sheet_order, defined_names);
+    let mut deps = extract_deps_regex(&scanned, &formula_key.sheet, sheet_order);
+    deps.cells.extend(defined_deps.cells);
+    deps.columns.extend(defined_deps.columns);
+    deps.cells.extend(structured_deps);
     deps
 }
 
@@ -7366,11 +8075,12 @@ fn formula_dependency_diagnostics(
         formula_keys,
         tables,
     ));
+    let cell_index = DependencyCellIndex::from_cells(cells);
     diagnostics.extend(defined_name_diagnostics(
         key,
         formula,
         &literal_stripped,
-        cells,
+        &cell_index,
         sheet_order,
         defined_names,
     ));
@@ -7781,7 +8491,7 @@ fn defined_name_diagnostics(
     key: &Key,
     formula: &str,
     literal_stripped: &str,
-    cells: &HashMap<Key, String>,
+    cell_index: &DependencyCellIndex,
     sheet_order: &[String],
     defined_names: &[DefinedName],
 ) -> Vec<HashMap<String, String>> {
@@ -7790,11 +8500,10 @@ fn defined_name_diagnostics(
     }
 
     let lookup = defined_name_lookup(defined_names, &key.sheet);
-    let name_re = Regex::new(r"\b[A-Za-z_][A-Za-z0-9_.]*\b").unwrap();
     let mut diagnostics = Vec::new();
     let mut seen = HashSet::new();
 
-    for item in name_re.find_iter(literal_stripped) {
+    for item in defined_name_token_regex().find_iter(literal_stripped) {
         let token = item.as_str();
         if !seen.insert(token.to_ascii_lowercase()) {
             continue;
@@ -7809,8 +8518,10 @@ fn defined_name_diagnostics(
         let target = target.trim().trim_start_matches('=');
         let stripped_target = strip_formula_string_literals(target);
         let masked_target = mask_unsupported_dependency_tokens(&stripped_target);
-        let deps = extract_deps_regex(&masked_target, &key.sheet, cells, sheet_order);
-        if deps.is_empty() {
+        let deps = extract_deps_regex(&masked_target, &key.sheet, sheet_order);
+        let dep_count =
+            expanded_dependency_count(&deps.cells, &deps.columns, &deps.ranges, cell_index);
+        if dep_count == 0 {
             diagnostics.push(dependency_diagnostic(
                 key,
                 formula,
@@ -7824,7 +8535,7 @@ fn defined_name_diagnostics(
                 ],
             ));
         } else {
-            let dep_count = deps.len().to_string();
+            let dep_count = dep_count.to_string();
             diagnostics.push(dependency_diagnostic(
                 key,
                 formula,
@@ -7844,16 +8555,10 @@ fn defined_name_diagnostics(
     diagnostics
 }
 
-fn extract_deps_regex(
-    formula: &str,
-    default_sheet: &str,
-    cells: &HashMap<Key, String>,
-    sheet_order: &[String],
-) -> HashSet<Key> {
-    let mut deps = HashSet::new();
-    let re = Regex::new(r"(?i)(?:(?:'((?:[^']|'')+)'|([A-Za-z_][A-Za-z0-9_ ]*(?::[A-Za-z_][A-Za-z0-9_ ]*)?))!)?\$?([A-Z]{1,3})\$?([0-9]+)(?::\$?([A-Z]{1,3})\$?([0-9]+))?").unwrap();
+fn extract_deps_regex(formula: &str, default_sheet: &str, sheet_order: &[String]) -> FormulaDeps {
+    let mut deps = FormulaDeps::default();
 
-    for cap in re.captures_iter(formula) {
+    for cap in dependency_cell_ref_regex().captures_iter(formula) {
         let sheets = sheet_targets(
             cap.get(1).or_else(|| cap.get(2)).map(|m| m.as_str()),
             default_sheet,
@@ -7869,25 +8574,37 @@ fn extract_deps_regex(
             .get(6)
             .and_then(|m| m.as_str().parse::<usize>().ok())
             .unwrap_or(start_row);
+        let row_lo = start_row.min(end_row);
+        let row_hi = start_row.max(end_row);
+        let col_lo = start_col.min(end_col);
+        let col_hi = start_col.max(end_col);
+        let range_area = (row_hi - row_lo + 1) * (col_hi - col_lo + 1);
 
         for sheet in sheets {
-            for row in start_row.min(end_row)..=start_row.max(end_row) {
-                for col in start_col.min(end_col)..=start_col.max(end_col) {
-                    deps.insert(Key {
-                        sheet: sheet.clone(),
-                        row,
-                        col,
-                    });
+            if range_area > BROAD_RANGE_COLUMN_DEP_CELL_THRESHOLD {
+                deps.ranges.insert(RangeDependency {
+                    sheet: sheet.clone(),
+                    start_row: row_lo,
+                    end_row: row_hi,
+                    start_col: col_lo,
+                    end_col: col_hi,
+                });
+            } else {
+                for row in row_lo..=row_hi {
+                    for col in col_lo..=col_hi {
+                        deps.cells.insert(Key {
+                            sheet: sheet.clone(),
+                            row,
+                            col,
+                        });
+                    }
                 }
             }
         }
     }
 
-    let col_re = Regex::new(
-        r"(?i)(?:(?:'((?:[^']|'')+)'|([A-Za-z_][A-Za-z0-9_ ]*(?::[A-Za-z_][A-Za-z0-9_ ]*)?))!)?\$?([A-Z]{1,3}):\$?([A-Z]{1,3})",
-    )
-    .unwrap();
-    for cap in col_re.captures_iter(formula) {
+    let mut seen_column_ranges = HashSet::new();
+    for cap in dependency_column_ref_regex().captures_iter(formula) {
         let sheets = sheet_targets(
             cap.get(1).or_else(|| cap.get(2)).map(|m| m.as_str()),
             default_sheet,
@@ -7896,13 +8613,16 @@ fn extract_deps_regex(
         let start_col = col_from_name(cap.get(3).unwrap().as_str()).unwrap_or(1);
         let end_col = col_from_name(cap.get(4).unwrap().as_str()).unwrap_or(start_col);
         for sheet in sheets {
-            for key in cells.keys() {
-                if key.sheet == sheet
-                    && key.col >= start_col.min(end_col)
-                    && key.col <= start_col.max(end_col)
-                {
-                    deps.insert(key.clone());
-                }
+            let lo = start_col.min(end_col);
+            let hi = start_col.max(end_col);
+            if !seen_column_ranges.insert((sheet.clone(), lo, hi)) {
+                continue;
+            }
+            for col in lo..=hi {
+                deps.columns.insert(ColumnDependency {
+                    sheet: sheet.clone(),
+                    col,
+                });
             }
         }
     }
@@ -7953,17 +8673,46 @@ fn strip_formula_string_literals(formula: &str) -> String {
 }
 
 fn mask_unsupported_dependency_tokens(formula: &str) -> String {
-    let without_external = mask_regex_matches(formula, &external_workbook_ref_regex());
+    let without_external = mask_regex_matches(formula, external_workbook_ref_regex());
     let without_structured = mask_structured_table_ref_tokens(&without_external);
-    let structured_brackets = Regex::new(r"\[[^\]]*\]").unwrap();
-    mask_regex_matches(&without_structured, &structured_brackets)
+    mask_regex_matches(&without_structured, structured_bracket_regex())
 }
 
-fn external_workbook_ref_regex() -> Regex {
-    Regex::new(
+fn dependency_cell_ref_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)(?:(?:'((?:[^']|'')+)'|([A-Za-z_][A-Za-z0-9_ ]*(?::[A-Za-z_][A-Za-z0-9_ ]*)?))!)?\$?([A-Z]{1,3})\$?([0-9]+)(?::\$?([A-Z]{1,3})\$?([0-9]+))?").unwrap()
+    })
+}
+
+fn dependency_column_ref_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:(?:'((?:[^']|'')+)'|([A-Za-z_][A-Za-z0-9_ ]*(?::[A-Za-z_][A-Za-z0-9_ ]*)?))!)?\$?([A-Z]{1,3}):\$?([A-Z]{1,3})",
+        )
+        .unwrap()
+    })
+}
+
+fn defined_name_token_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b[A-Za-z_][A-Za-z0-9_.]*\b").unwrap())
+}
+
+fn structured_bracket_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\[[^\]]*\]").unwrap())
+}
+
+fn external_workbook_ref_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
         r"(?i)(?:'\[[^']+\]'|\[[^\]]+\][^!(),+\-*/^&=<> ]*)!\$?(?:[A-Z]{1,3}\$?[0-9]+(?::\$?[A-Z]{1,3}\$?[0-9]+)?|[A-Z]{1,3}:\$?[A-Z]{1,3})",
     )
     .unwrap()
+    })
 }
 
 fn mask_regex_matches(input: &str, re: &Regex) -> String {
@@ -8406,28 +9155,30 @@ fn add_table_range_deps(
 }
 
 fn has_structured_table_ref(formula: &str) -> bool {
-    let re = Regex::new(r"(?i)\b[A-Za-z_][A-Za-z0-9_]*\s*(?:\[[^\]]+\])+").unwrap();
-    re.is_match(formula)
+    structured_ref_token_regex().is_match(formula)
+}
+
+fn structured_ref_token_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)\b[A-Za-z_][A-Za-z0-9_]*\s*(?:\[[^\]]+\])+").unwrap())
 }
 
 fn extract_defined_name_deps(
     formula: &str,
     default_sheet: &str,
-    cells: &HashMap<Key, String>,
     sheet_order: &[String],
     defined_names: &[DefinedName],
-) -> (HashSet<Key>, String) {
+) -> (FormulaDeps, String) {
     if defined_names.is_empty() {
-        return (HashSet::new(), formula.to_string());
+        return (FormulaDeps::default(), formula.to_string());
     }
 
     let lookup = defined_name_lookup(defined_names, default_sheet);
-    let name_re = Regex::new(r"\b[A-Za-z_][A-Za-z0-9_.]*\b").unwrap();
-    let mut deps = HashSet::new();
+    let mut deps = FormulaDeps::default();
     let mut output = String::with_capacity(formula.len());
     let mut last = 0;
 
-    for item in name_re.find_iter(formula) {
+    for item in defined_name_token_regex().find_iter(formula) {
         let token = item.as_str();
         let token_lower = token.to_ascii_lowercase();
         let Some(target) = lookup.get(&token_lower) else {
@@ -8443,12 +9194,9 @@ fn extract_defined_name_deps(
 
         let target = target.trim().trim_start_matches('=');
         let target = mask_unsupported_dependency_tokens(&strip_formula_string_literals(target));
-        deps.extend(extract_deps_regex(
-            &target,
-            default_sheet,
-            cells,
-            sheet_order,
-        ));
+        let target_deps = extract_deps_regex(&target, default_sheet, sheet_order);
+        deps.cells.extend(target_deps.cells);
+        deps.columns.extend(target_deps.columns);
     }
 
     output.push_str(&formula[last..]);
@@ -8473,6 +9221,225 @@ fn defined_name_lookup<'a>(
     lookup
 }
 
+fn resolve_defined_names_in_formula(
+    formula: &str,
+    default_sheet: &str,
+    defined_names: &[DefinedName],
+) -> PyResult<String> {
+    let mut stack = HashSet::new();
+    resolve_defined_names_in_formula_inner(formula, default_sheet, defined_names, &mut stack, 0)
+}
+
+fn resolve_defined_names_in_formula_inner(
+    formula: &str,
+    default_sheet: &str,
+    defined_names: &[DefinedName],
+    stack: &mut HashSet<String>,
+    depth: usize,
+) -> PyResult<String> {
+    if defined_names.is_empty() || depth > 16 {
+        return Ok(formula.to_string());
+    }
+
+    let lookup = defined_name_lookup(defined_names, default_sheet);
+    let mut output = String::with_capacity(formula.len());
+    let mut last = 0usize;
+
+    for item in defined_name_token_regex().find_iter(formula) {
+        let token = item.as_str();
+        let token_lower = token.to_ascii_lowercase();
+        let Some(target) = lookup.get(&token_lower) else {
+            continue;
+        };
+        if !is_defined_name_context(formula, item.start(), item.end())
+            || formula_offset_in_string_literal(formula, item.start())
+        {
+            continue;
+        }
+        if !stack.insert(token_lower.clone()) {
+            return Err(PyValueError::new_err(format!(
+                "unsupported_formula: defined name cycle detected at {token}"
+            )));
+        }
+        let target = target.trim().trim_start_matches('=');
+        let resolved_target = resolve_defined_names_in_formula_inner(
+            target,
+            default_sheet,
+            defined_names,
+            stack,
+            depth + 1,
+        )?;
+        stack.remove(&token_lower);
+
+        output.push_str(&formula[last..item.start()]);
+        output.push_str(&resolved_target);
+        last = item.end();
+    }
+
+    output.push_str(&formula[last..]);
+    Ok(output)
+}
+
+fn resolve_structured_refs_in_formula(
+    formula: &str,
+    formula_key: &Key,
+    tables: &[TableInfo],
+) -> PyResult<String> {
+    let Some(spans) = structured_ref_spans(formula) else {
+        return Err(PyValueError::new_err(
+            "unsupported_formula: structured table reference syntax could not be parsed",
+        ));
+    };
+    if spans.is_empty() {
+        return Ok(formula.to_string());
+    }
+
+    let mut output = formula.to_string();
+    for (start, end) in spans.into_iter().rev() {
+        let token = &formula[start..end];
+        let Some((table_name, selector)) =
+            structured_ref_specs(token).and_then(|mut refs| refs.pop())
+        else {
+            return Err(PyValueError::new_err(format!(
+                "unsupported_formula: structured table reference is not supported: {token}"
+            )));
+        };
+        let Some(table) = tables
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(table_name))
+        else {
+            return Err(PyValueError::new_err(format!(
+                "unsupported_formula: structured table not found: {table_name}"
+            )));
+        };
+        let Some(replacement) = structured_ref_to_a1(table, selector, formula_key) else {
+            return Err(PyValueError::new_err(format!(
+                "unsupported_formula: structured table selector is not supported: {token}"
+            )));
+        };
+        output.replace_range(start..end, &replacement);
+    }
+    Ok(output)
+}
+
+fn structured_ref_to_a1(table: &TableInfo, selector: &str, formula_key: &Key) -> Option<String> {
+    let selector = selector.trim();
+    if selector.eq_ignore_ascii_case("[#All]") {
+        return table_a1_ref(
+            table,
+            table.start_row,
+            table.end_row,
+            table.start_col,
+            table.end_col,
+        );
+    }
+    if selector.eq_ignore_ascii_case("[#Data]") {
+        return table_a1_ref(
+            table,
+            table.data_start_row(),
+            table.data_end_row(),
+            table.start_col,
+            table.end_col,
+        );
+    }
+    if selector.eq_ignore_ascii_case("[#Headers]") {
+        return table_a1_ref(
+            table,
+            table.start_row,
+            table.start_row,
+            table.start_col,
+            table.end_col,
+        );
+    }
+    if selector.eq_ignore_ascii_case("[#Totals]") {
+        let totals_row = table.totals_row?;
+        return table_a1_ref(
+            table,
+            totals_row,
+            totals_row,
+            table.start_col,
+            table.end_col,
+        );
+    }
+    if let Some(column_name) = simple_structured_column(selector) {
+        return table_column_a1_ref(
+            table,
+            column_name,
+            table.data_start_row(),
+            table.data_end_row(),
+        );
+    }
+    if let Some((selector_kind, start_column, end_column)) = structured_column_range(selector) {
+        let (start_col, end_col) = table.column_span(start_column, end_column)?;
+        let (start_row, end_row) = match selector_kind {
+            "column_range" | "data_column_range" => (table.data_start_row(), table.data_end_row()),
+            "all_column_range" => (table.start_row, table.end_row),
+            "header_column_range" => (table.start_row, table.start_row),
+            "totals_column_range" => {
+                let totals_row = table.totals_row?;
+                (totals_row, totals_row)
+            }
+            _ => return None,
+        };
+        return table_a1_ref(table, start_row, end_row, start_col, end_col);
+    }
+    if let Some((selector_kind, column_name)) = structured_qualified_column(selector) {
+        let (start_row, end_row) = match selector_kind {
+            "data_column" => (table.data_start_row(), table.data_end_row()),
+            "all_column" => (table.start_row, table.end_row),
+            "header_column" => (table.start_row, table.start_row),
+            "totals_column" => {
+                let totals_row = table.totals_row?;
+                (totals_row, totals_row)
+            }
+            _ => return None,
+        };
+        return table_column_a1_ref(table, column_name, start_row, end_row);
+    }
+    if let Some(column_name) = structured_row_scoped_column(selector) {
+        if !formula_cell_in_table_data_row(formula_key, table) {
+            return None;
+        }
+        return table_column_a1_ref(table, column_name, formula_key.row, formula_key.row);
+    }
+    None
+}
+
+fn table_column_a1_ref(
+    table: &TableInfo,
+    column_name: &str,
+    start_row: usize,
+    end_row: usize,
+) -> Option<String> {
+    let col_offset = table.column_offset(column_name)?;
+    let col = table.start_col + col_offset;
+    table_a1_ref(table, start_row, end_row, col, col)
+}
+
+fn table_a1_ref(
+    table: &TableInfo,
+    start_row: usize,
+    end_row: usize,
+    start_col: usize,
+    end_col: usize,
+) -> Option<String> {
+    if start_row == 0 || end_row == 0 || start_col == 0 || end_col == 0 || start_row > end_row {
+        return None;
+    }
+    let sheet = quote_sheet_name(&table.sheet);
+    let start_ref = format!("{sheet}!{}{}", col_to_name(start_col), start_row);
+    let end_ref = format!("{sheet}!{}{}", col_to_name(end_col), end_row);
+    if start_ref == end_ref {
+        Some(start_ref)
+    } else {
+        Some(format!("{start_ref}:{end_ref}"))
+    }
+}
+
+fn quote_sheet_name(sheet: &str) -> String {
+    format!("'{}'", sheet.replace('\'', "''"))
+}
+
 fn is_defined_name_context(formula: &str, start: usize, end: usize) -> bool {
     let prev = formula[..start].chars().next_back();
     if matches!(prev, Some('\'') | Some('!') | Some('[')) {
@@ -8480,7 +9447,7 @@ fn is_defined_name_context(formula: &str, start: usize, end: usize) -> bool {
     }
 
     let next = formula[end..].chars().find(|ch| !ch.is_whitespace());
-    if matches!(next, Some('!') | Some('(')) {
+    if matches!(next, Some('!') | Some('(') | Some('[')) {
         return false;
     }
 
@@ -8502,9 +9469,14 @@ fn evaluate_formula_mvp(
         return Ok(cells.get(&key).cloned().unwrap_or_default());
     }
 
+    expr = eval_zero_arg_volatile_calls(&expr)?;
     expr = eval_iferror_calls(&expr, default_sheet, cells)?;
     expr = eval_if_calls(&expr, default_sheet, cells)?;
+    expr = eval_let_calls(&expr, default_sheet, cells)?;
+    expr = eval_lambda_invocations(&expr, default_sheet, cells)?;
     expr = eval_logical_calls(&expr, default_sheet, cells)?;
+    expr = eval_averageifs_calls(&expr, default_sheet, cells)?;
+    expr = eval_averageif_calls(&expr, default_sheet, cells)?;
     expr = eval_sumifs_calls(&expr, default_sheet, cells)?;
     expr = eval_sumif_calls(&expr, default_sheet, cells)?;
     expr = eval_countifs_calls(&expr, default_sheet, cells)?;
@@ -8519,6 +9491,8 @@ fn evaluate_formula_mvp(
     expr = eval_aggregate_calls(&expr, default_sheet, cells, "COUNTBLANK")?;
     expr = eval_text_calls(&expr, default_sheet, cells)?;
     expr = eval_concat_operator(&expr, default_sheet, cells)?;
+    expr = eval_date_calls(&expr, default_sheet, cells)?;
+    expr = eval_dynamic_array_calls(&expr, default_sheet, cells)?;
     expr = eval_round_calls(&expr, default_sheet, cells)?;
     reject_unsupported_functions(&expr)?;
     expr = replace_cell_refs(&expr, default_sheet, cells)?;
@@ -8555,6 +9529,27 @@ fn eval_iferror_calls(
     }
 
     Ok(current)
+}
+
+fn eval_zero_arg_volatile_calls(expr: &str) -> PyResult<String> {
+    let mut current = expr.to_string();
+    current = replace_zero_arg_function(&current, "TODAY", &format_number(today_excel_serial()?))?;
+    current = replace_zero_arg_function(&current, "NOW", &format_number(now_excel_serial()?))?;
+    current = replace_zero_arg_function(&current, "RAND", &format_number(volatile_fraction()?))?;
+    Ok(current)
+}
+
+fn replace_zero_arg_function(
+    expr: &str,
+    function_name: &str,
+    replacement: &str,
+) -> PyResult<String> {
+    let re = Regex::new(&format!(
+        r"(?i)\b{}\s*\(\s*\)",
+        regex::escape(function_name)
+    ))
+    .unwrap();
+    Ok(re.replace_all(expr, replacement).to_string())
 }
 
 fn eval_if_calls(
@@ -8630,6 +9625,172 @@ fn eval_logical_calls(
         }
         let matched = !evaluate_condition(&args[0], default_sheet, cells)?;
         current.replace_range(call.start..call.end, if matched { "1" } else { "0" });
+    }
+
+    Ok(current)
+}
+
+fn eval_let_calls(
+    expr: &str,
+    default_sheet: &str,
+    cells: &HashMap<Key, String>,
+) -> PyResult<String> {
+    let mut current = expr.to_string();
+
+    while let Some(call) = find_function_call(&current, "LET") {
+        let args = split_args(&call.args);
+        if args.len() < 3 || args.len() % 2 == 0 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: LET expects name/value pairs plus a calculation",
+            ));
+        }
+        let mut body = args.last().cloned().unwrap_or_default();
+        for pair in args[..args.len() - 1].chunks(2) {
+            let name = pair[0].trim();
+            if !is_formula_identifier(name) {
+                return Err(PyValueError::new_err(
+                    "unsupported_formula: LET variable names must be simple identifiers",
+                ));
+            }
+            let value = evaluate_formula_mvp(&format!("={}", pair[1]), default_sheet, cells)
+                .unwrap_or_else(|_| strip_quotes(&pair[1]));
+            body = substitute_formula_identifier(&body, name, &formula_literal_for_value(&value));
+        }
+        let replacement = evaluate_formula_mvp(&format!("={body}"), default_sheet, cells)
+            .unwrap_or_else(|_| strip_quotes(&body));
+        current.replace_range(
+            call.start..call.end,
+            &formula_literal_for_value(&replacement),
+        );
+    }
+
+    Ok(current)
+}
+
+fn eval_lambda_invocations(
+    expr: &str,
+    default_sheet: &str,
+    cells: &HashMap<Key, String>,
+) -> PyResult<String> {
+    let mut current = expr.to_string();
+
+    while let Some(call) = find_function_call(&current, "LAMBDA") {
+        let Some(invocation) = function_call_at(&current, call.end) else {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: LAMBDA must be invoked immediately in the current MVP evaluator",
+            ));
+        };
+        let lambda_args = split_args(&call.args);
+        let invocation_args = split_args(&invocation.args);
+        if lambda_args.len() < 2 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: LAMBDA expects parameters plus a body",
+            ));
+        }
+        let params = &lambda_args[..lambda_args.len() - 1];
+        if params.len() != invocation_args.len() {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: LAMBDA invocation arity does not match parameters",
+            ));
+        }
+        let mut body = lambda_args.last().cloned().unwrap_or_default();
+        for (param, arg) in params.iter().zip(invocation_args.iter()) {
+            let param = param.trim();
+            if !is_formula_identifier(param) {
+                return Err(PyValueError::new_err(
+                    "unsupported_formula: LAMBDA parameters must be simple identifiers",
+                ));
+            }
+            let value = evaluate_formula_mvp(&format!("={arg}"), default_sheet, cells)
+                .unwrap_or_else(|_| strip_quotes(arg));
+            body = substitute_formula_identifier(&body, param, &formula_literal_for_value(&value));
+        }
+        let replacement = evaluate_formula_mvp(&format!("={body}"), default_sheet, cells)
+            .unwrap_or_else(|_| strip_quotes(&body));
+        current.replace_range(
+            call.start..invocation.end,
+            &formula_literal_for_value(&replacement),
+        );
+    }
+
+    Ok(current)
+}
+
+fn eval_averageifs_calls(
+    expr: &str,
+    default_sheet: &str,
+    cells: &HashMap<Key, String>,
+) -> PyResult<String> {
+    let mut current = expr.to_string();
+
+    while let Some(call) = find_function_call(&current, "AVERAGEIFS") {
+        let args = split_args(&call.args);
+        if args.len() < 3 || args.len() % 2 == 0 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: AVERAGEIFS expects average_range plus range/criteria pairs",
+            ));
+        }
+        let average_range = range_values(&args[0], default_sheet, cells);
+        let mut values = Vec::new();
+        for idx in 0..average_range.len() {
+            let mut matched = true;
+            for pair in args[1..].chunks(2) {
+                let criteria_values = range_values(&pair[0], default_sheet, cells);
+                let value = criteria_values
+                    .get(idx)
+                    .map(|(_, value)| value.as_str())
+                    .unwrap_or("");
+                let criteria = eval_criteria(&pair[1], default_sheet, cells);
+                if !criteria_matches(value, &criteria) {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched {
+                if let Ok(value) = average_range[idx].1.parse::<f64>() {
+                    values.push(value);
+                }
+            }
+        }
+        current.replace_range(call.start..call.end, &format_number(average(&values)));
+    }
+
+    Ok(current)
+}
+
+fn eval_averageif_calls(
+    expr: &str,
+    default_sheet: &str,
+    cells: &HashMap<Key, String>,
+) -> PyResult<String> {
+    let mut current = expr.to_string();
+
+    while let Some(call) = find_function_call(&current, "AVERAGEIF") {
+        let args = split_args(&call.args);
+        if args.len() != 2 && args.len() != 3 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: AVERAGEIF expects 2 or 3 arguments",
+            ));
+        }
+        let criteria = eval_criteria(&args[1], default_sheet, cells);
+        let criteria_range = range_values(&args[0], default_sheet, cells);
+        let average_range = if args.len() == 3 {
+            range_values(&args[2], default_sheet, cells)
+        } else {
+            criteria_range.clone()
+        };
+        let mut values = Vec::new();
+        for (idx, (_, criteria_value)) in criteria_range.iter().enumerate() {
+            if criteria_matches(criteria_value, &criteria) {
+                if let Some(value) = average_range
+                    .get(idx)
+                    .and_then(|(_, value)| value.parse::<f64>().ok())
+                {
+                    values.push(value);
+                }
+            }
+        }
+        current.replace_range(call.start..call.end, &format_number(average(&values)));
     }
 
     Ok(current)
@@ -8792,7 +9953,9 @@ fn eval_aggregate_calls(
 
         for arg in args {
             let arg = arg.trim();
-            if arg.contains(':') {
+            if is_array_literal(arg) {
+                values.extend(array_literal_values(arg));
+            } else if arg.contains(':') {
                 values.extend(
                     range_values(arg, default_sheet, cells)
                         .into_iter()
@@ -8954,7 +10117,19 @@ fn eval_text_calls(
         let args = split_args(&call.args);
         let mut result = String::new();
         for arg in args {
-            result.push_str(&evaluate_text_arg(&arg, default_sheet, cells)?);
+            for value in text_values_arg(&arg, default_sheet, cells)? {
+                result.push_str(&value);
+            }
+        }
+        current.replace_range(call.start..call.end, &format!("\"{}\"", result));
+    }
+    while let Some(call) = find_function_call(&current, "CONCATENATE") {
+        let args = split_args(&call.args);
+        let mut result = String::new();
+        for arg in args {
+            for value in text_values_arg(&arg, default_sheet, cells)? {
+                result.push_str(&value);
+            }
         }
         current.replace_range(call.start..call.end, &format!("\"{}\"", result));
     }
@@ -8969,9 +10144,10 @@ fn eval_text_calls(
         let ignore_empty = args[1].trim().eq_ignore_ascii_case("TRUE");
         let mut values = Vec::new();
         for arg in &args[2..] {
-            let value = evaluate_text_arg(arg, default_sheet, cells)?;
-            if !ignore_empty || !value.is_empty() {
-                values.push(value);
+            for value in text_values_arg(arg, default_sheet, cells)? {
+                if !ignore_empty || !value.is_empty() {
+                    values.push(value);
+                }
             }
         }
         current.replace_range(
@@ -9054,6 +10230,310 @@ fn format_text_value(value: f64, format_code: &str) -> PyResult<String> {
     )))
 }
 
+fn eval_date_calls(
+    expr: &str,
+    default_sheet: &str,
+    cells: &HashMap<Key, String>,
+) -> PyResult<String> {
+    let mut current = expr.to_string();
+
+    while let Some(call) = find_function_call(&current, "TODAY") {
+        if !call.args.trim().is_empty() {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: TODAY expects no arguments",
+            ));
+        }
+        current.replace_range(call.start..call.end, &format_number(today_excel_serial()?));
+    }
+    while let Some(call) = find_function_call(&current, "NOW") {
+        if !call.args.trim().is_empty() {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: NOW expects no arguments",
+            ));
+        }
+        current.replace_range(call.start..call.end, &format_number(now_excel_serial()?));
+    }
+    while let Some(call) = find_function_call(&current, "RANDBETWEEN") {
+        let args = split_args(&call.args);
+        if args.len() != 2 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: RANDBETWEEN expects bottom and top",
+            ));
+        }
+        let bottom = evaluate_numeric_arg(&args[0], default_sheet, cells)? as i64;
+        let top = evaluate_numeric_arg(&args[1], default_sheet, cells)? as i64;
+        let low = bottom.min(top);
+        let high = bottom.max(top);
+        let span = (high - low + 1).max(1);
+        let value = low + (volatile_fraction()? * span as f64).floor() as i64;
+        current.replace_range(call.start..call.end, &value.to_string());
+    }
+    while let Some(call) = find_function_call(&current, "RAND") {
+        if !call.args.trim().is_empty() {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: RAND expects no arguments",
+            ));
+        }
+        current.replace_range(call.start..call.end, &format_number(volatile_fraction()?));
+    }
+    while let Some(call) = find_function_call(&current, "DATE") {
+        let args = split_args(&call.args);
+        if args.len() != 3 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: DATE expects 3 arguments",
+            ));
+        }
+        let year = evaluate_numeric_arg(&args[0], default_sheet, cells)? as i32;
+        let month = evaluate_numeric_arg(&args[1], default_sheet, cells)? as i32;
+        let day = evaluate_numeric_arg(&args[2], default_sheet, cells)? as i32;
+        let (year, month, day) = normalize_ymd(year, month, day);
+        current.replace_range(
+            call.start..call.end,
+            &format_number(excel_serial_from_ymd(year, month, day) as f64),
+        );
+    }
+    while let Some(call) = find_function_call(&current, "EOMONTH") {
+        let args = split_args(&call.args);
+        if args.len() != 2 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: EOMONTH expects 2 arguments",
+            ));
+        }
+        let serial = evaluate_numeric_arg(&args[0], default_sheet, cells)?;
+        let months = evaluate_numeric_arg(&args[1], default_sheet, cells)? as i32;
+        let (year, month, _) = ymd_from_excel_serial(serial as i64).ok_or_else(|| {
+            PyValueError::new_err("unsupported_formula: EOMONTH start date is invalid")
+        })?;
+        let (target_year, target_month) = add_months(year, month, months);
+        let day = days_in_month(target_year, target_month);
+        current.replace_range(
+            call.start..call.end,
+            &format_number(excel_serial_from_ymd(target_year, target_month, day) as f64),
+        );
+    }
+    while let Some(call) = find_function_call(&current, "YEAR") {
+        let args = split_args(&call.args);
+        if args.len() != 1 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: YEAR expects 1 argument",
+            ));
+        }
+        let serial = evaluate_numeric_arg(&args[0], default_sheet, cells)? as i64;
+        let (year, _, _) = ymd_from_excel_serial(serial).ok_or_else(|| {
+            PyValueError::new_err("unsupported_formula: YEAR date serial is invalid")
+        })?;
+        current.replace_range(call.start..call.end, &year.to_string());
+    }
+    while let Some(call) = find_function_call(&current, "MONTH") {
+        let args = split_args(&call.args);
+        if args.len() != 1 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: MONTH expects 1 argument",
+            ));
+        }
+        let serial = evaluate_numeric_arg(&args[0], default_sheet, cells)? as i64;
+        let (_, month, _) = ymd_from_excel_serial(serial).ok_or_else(|| {
+            PyValueError::new_err("unsupported_formula: MONTH date serial is invalid")
+        })?;
+        current.replace_range(call.start..call.end, &month.to_string());
+    }
+    while let Some(call) = find_function_call(&current, "DAY") {
+        let args = split_args(&call.args);
+        if args.len() != 1 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: DAY expects 1 argument",
+            ));
+        }
+        let serial = evaluate_numeric_arg(&args[0], default_sheet, cells)? as i64;
+        let (_, _, day) = ymd_from_excel_serial(serial).ok_or_else(|| {
+            PyValueError::new_err("unsupported_formula: DAY date serial is invalid")
+        })?;
+        current.replace_range(call.start..call.end, &day.to_string());
+    }
+
+    Ok(current)
+}
+
+fn eval_dynamic_array_calls(
+    expr: &str,
+    default_sheet: &str,
+    cells: &HashMap<Key, String>,
+) -> PyResult<String> {
+    let mut current = expr.to_string();
+
+    while let Some(call) = find_function_call(&current, "FILTER") {
+        let args = split_args(&call.args);
+        if args.len() < 2 || args.len() > 3 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: FILTER expects array, include, and optional if_empty",
+            ));
+        }
+        let values = range_matrix_or_literal(&args[0], default_sheet, cells);
+        let include = filter_include_mask(&args[1], default_sheet, cells, values.len())?;
+        let filtered: Vec<Vec<String>> = values
+            .into_iter()
+            .zip(include.into_iter())
+            .filter_map(|(row, keep)| keep.then_some(row))
+            .collect();
+        let result = if filtered.is_empty() && args.len() == 3 {
+            evaluate_text_arg(&args[2], default_sheet, cells)?
+        } else {
+            matrix_cached_value(&filtered)
+        };
+        current.replace_range(call.start..call.end, &format!("\"{}\"", result));
+    }
+    while let Some(call) = find_function_call(&current, "UNIQUE") {
+        let args = split_args(&call.args);
+        if args.is_empty() || args.len() > 3 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: UNIQUE expects array plus optional flags",
+            ));
+        }
+        if args
+            .get(1)
+            .map(|arg| truthy_formula_value(arg))
+            .unwrap_or(false)
+        {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: UNIQUE by_col is not supported in the current MVP evaluator",
+            ));
+        }
+        let exactly_once = args
+            .get(2)
+            .map(|arg| truthy_formula_value(arg))
+            .unwrap_or(false);
+        let source_values = range_matrix_or_literal(&args[0], default_sheet, cells);
+        let mut counts: HashMap<Vec<String>, usize> = HashMap::new();
+        for row in &source_values {
+            *counts.entry(row.clone()).or_insert(0) += 1;
+        }
+        let mut seen = HashSet::new();
+        let mut unique = Vec::new();
+        for row in source_values {
+            if seen.insert(row.clone()) && (!exactly_once || counts.get(&row) == Some(&1)) {
+                unique.push(row);
+            }
+        }
+        current.replace_range(
+            call.start..call.end,
+            &format!("\"{}\"", matrix_cached_value(&unique)),
+        );
+    }
+    while let Some(call) = find_function_call(&current, "SORTBY") {
+        let args = split_args(&call.args);
+        if args.len() < 2 || (args.len() != 2 && args.len() % 2 != 1) {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: SORTBY expects array plus by_array/sort_order pairs",
+            ));
+        }
+        let values = range_matrix_or_literal(&args[0], default_sheet, cells);
+        let mut sorters = Vec::new();
+        for pair in args[1..].chunks(2) {
+            let by_values =
+                matrix_first_column(range_matrix_or_literal(&pair[0], default_sheet, cells));
+            let sort_order = if pair.len() == 2 {
+                evaluate_numeric_arg(&pair[1], default_sheet, cells)?
+            } else {
+                1.0
+            };
+            if sort_order != 1.0 && sort_order != -1.0 {
+                return Err(PyValueError::new_err(
+                    "unsupported_formula: SORTBY sort_order must be 1 or -1",
+                ));
+            }
+            sorters.push((by_values, sort_order < 0.0));
+        }
+        let mut pairs: Vec<(Vec<String>, Vec<String>)> = values
+            .into_iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                let keys = sorters
+                    .iter()
+                    .map(|(by_values, _)| by_values.get(idx).cloned().unwrap_or_default())
+                    .collect();
+                (keys, row)
+            })
+            .collect();
+        pairs.sort_by(|left, right| {
+            for (sort_idx, (_, descending)) in sorters.iter().enumerate() {
+                let ordering = compare_sort_values(&left.0[sort_idx], &right.0[sort_idx]);
+                if ordering != std::cmp::Ordering::Equal {
+                    return if *descending {
+                        ordering.reverse()
+                    } else {
+                        ordering
+                    };
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        let result: Vec<Vec<String>> = pairs.into_iter().map(|(_, row)| row).collect();
+        current.replace_range(
+            call.start..call.end,
+            &format!("\"{}\"", matrix_cached_value(&result)),
+        );
+    }
+    while let Some(call) = find_function_call(&current, "SORT") {
+        let args = split_args(&call.args);
+        if args.is_empty() || args.len() > 4 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: SORT expects array plus optional sort arguments",
+            ));
+        }
+        let sort_index = args
+            .get(1)
+            .map(|arg| evaluate_numeric_arg(arg, default_sheet, cells))
+            .transpose()?
+            .unwrap_or(1.0);
+        if sort_index < 1.0 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: SORT sort_index must be positive",
+            ));
+        }
+        let descending = args
+            .get(2)
+            .map(|arg| evaluate_numeric_arg(arg, default_sheet, cells))
+            .transpose()?
+            .map(|order| {
+                if order == 1.0 || order == -1.0 {
+                    Ok(order < 0.0)
+                } else {
+                    Err(PyValueError::new_err(
+                        "unsupported_formula: SORT sort_order must be 1 or -1",
+                    ))
+                }
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if args
+            .get(3)
+            .map(|arg| truthy_formula_value(arg))
+            .unwrap_or(false)
+        {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: SORT by_col is not supported in the current MVP evaluator",
+            ));
+        }
+        let mut values = range_matrix_or_literal(&args[0], default_sheet, cells);
+        let sort_idx = sort_index as usize - 1;
+        values.sort_by(|left, right| {
+            compare_sort_values(
+                left.get(sort_idx).map(String::as_str).unwrap_or(""),
+                right.get(sort_idx).map(String::as_str).unwrap_or(""),
+            )
+        });
+        if descending {
+            values.reverse();
+        }
+        current.replace_range(
+            call.start..call.end,
+            &format!("\"{}\"", matrix_cached_value(&values)),
+        );
+    }
+
+    Ok(current)
+}
+
 fn eval_lookup_calls(
     expr: &str,
     default_sheet: &str,
@@ -9089,6 +10569,82 @@ fn eval_lookup_calls(
         let Some(value) = found else {
             return Err(PyValueError::new_err(
                 "unsupported_formula: VLOOKUP exact match not found",
+            ));
+        };
+        current.replace_range(call.start..call.end, &format!("\"{}\"", value));
+    }
+    while let Some(call) = find_function_call(&current, "HLOOKUP") {
+        let args = split_args(&call.args);
+        if args.len() < 3 || args.len() > 4 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: HLOOKUP expects 3 or 4 arguments",
+            ));
+        }
+        if args.len() == 4 && !matches!(args[3].trim().to_ascii_uppercase().as_str(), "FALSE" | "0")
+        {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: HLOOKUP approximate match is not supported",
+            ));
+        }
+        let lookup = evaluate_text_arg(&args[0], default_sheet, cells)?;
+        let row_index = evaluate_numeric_arg(&args[2], default_sheet, cells)? as usize;
+        let rows = range_rows(&args[1], default_sheet, cells);
+        let Some(header_row) = rows.first() else {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: HLOOKUP table range is empty",
+            ));
+        };
+        let Some(col_idx) = header_row.iter().position(|(_, value)| value == &lookup) else {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: HLOOKUP exact match not found",
+            ));
+        };
+        let value = rows
+            .get(row_index.saturating_sub(1))
+            .and_then(|row| row.get(col_idx))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        current.replace_range(call.start..call.end, &format!("\"{}\"", value));
+    }
+    while let Some(call) = find_function_call(&current, "XLOOKUP") {
+        let args = split_args(&call.args);
+        if args.len() < 3 || args.len() > 6 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: XLOOKUP expects lookup_value, lookup_array, return_array, and optional arguments",
+            ));
+        }
+        if args.len() >= 5 && !matches!(args[4].trim(), "0") {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: XLOOKUP currently supports exact match only",
+            ));
+        }
+        let reverse = args
+            .get(5)
+            .and_then(|arg| evaluate_numeric_arg(arg, default_sheet, cells).ok())
+            .map(|mode| mode < 0.0)
+            .unwrap_or(false);
+        let lookup = evaluate_text_arg(&args[0], default_sheet, cells)?;
+        let lookup_values = range_values(&args[1], default_sheet, cells);
+        let return_values = range_values(&args[2], default_sheet, cells);
+        let positions: Box<dyn Iterator<Item = usize>> = if reverse {
+            Box::new((0..lookup_values.len()).rev())
+        } else {
+            Box::new(0..lookup_values.len())
+        };
+        let mut found = None;
+        for idx in positions {
+            if lookup_values.get(idx).map(|(_, value)| value.as_str()) == Some(lookup.as_str()) {
+                found = return_values.get(idx).map(|(_, value)| value.clone());
+                break;
+            }
+        }
+        let value = if let Some(value) = found {
+            value
+        } else if args.len() >= 4 {
+            evaluate_text_arg(&args[3], default_sheet, cells)?
+        } else {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: XLOOKUP exact match not found",
             ));
         };
         current.replace_range(call.start..call.end, &format!("\"{}\"", value));
@@ -9171,6 +10727,11 @@ fn evaluate_numeric_arg(
     cells: &HashMap<Key, String>,
 ) -> PyResult<f64> {
     let mut expr = arg.trim().to_string();
+    expr = eval_zero_arg_volatile_calls(&expr)?;
+    expr = eval_let_calls(&expr, default_sheet, cells)?;
+    expr = eval_lambda_invocations(&expr, default_sheet, cells)?;
+    expr = eval_averageifs_calls(&expr, default_sheet, cells)?;
+    expr = eval_averageif_calls(&expr, default_sheet, cells)?;
     expr = eval_countifs_calls(&expr, default_sheet, cells)?;
     expr = eval_sumifs_calls(&expr, default_sheet, cells)?;
     expr = eval_sumif_calls(&expr, default_sheet, cells)?;
@@ -9184,6 +10745,8 @@ fn evaluate_numeric_arg(
     expr = eval_aggregate_calls(&expr, default_sheet, cells, "COUNTA")?;
     expr = eval_aggregate_calls(&expr, default_sheet, cells, "COUNTBLANK")?;
     expr = eval_text_calls(&expr, default_sheet, cells)?;
+    expr = eval_date_calls(&expr, default_sheet, cells)?;
+    expr = eval_dynamic_array_calls(&expr, default_sheet, cells)?;
     expr = eval_round_calls(&expr, default_sheet, cells)?;
     reject_unsupported_functions(&expr)?;
     expr = replace_cell_refs(&expr, default_sheet, cells)?;
@@ -9259,6 +10822,11 @@ fn replace_cell_refs(
     for cap in re.captures_iter(expr) {
         let m = cap.get(0).unwrap();
         output.push_str(&expr[last..m.start()]);
+        if is_inside_formula_string(expr, m.start()) {
+            output.push_str(m.as_str());
+            last = m.end();
+            continue;
+        }
         let sheet = cap
             .get(1)
             .or_else(|| cap.get(2))
@@ -9280,6 +10848,23 @@ fn replace_cell_refs(
 
     output.push_str(&expr[last..]);
     Ok(output)
+}
+
+fn is_inside_formula_string(expr: &str, pos: usize) -> bool {
+    let mut in_string = false;
+    let mut idx = 0usize;
+    while idx < pos {
+        let ch = expr[idx..].chars().next().unwrap();
+        if ch == '"' {
+            if in_string && expr[idx + ch.len_utf8()..].starts_with('"') {
+                idx += ch.len_utf8() * 2;
+                continue;
+            }
+            in_string = !in_string;
+        }
+        idx += ch.len_utf8();
+    }
+    in_string
 }
 
 #[derive(Debug)]
@@ -9328,10 +10913,109 @@ fn find_function_call(expr: &str, function_name: &str) -> Option<FunctionCall> {
     None
 }
 
+fn function_call_at(expr: &str, start: usize) -> Option<FunctionCall> {
+    if !expr[start..].starts_with('(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_string = false;
+    for (offset, ch) in expr[start..].char_indices() {
+        if ch == '"' {
+            in_string = !in_string;
+        } else if !in_string && ch == '(' {
+            depth += 1;
+        } else if !in_string && ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                let end = start + offset + 1;
+                return Some(FunctionCall {
+                    start,
+                    end,
+                    args: expr[start + 1..end - 1].to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
+fn is_formula_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn substitute_formula_identifier(expr: &str, name: &str, replacement: &str) -> String {
+    let mut output = String::new();
+    let mut idx = 0usize;
+    let mut in_string = false;
+    let name_len = name.len();
+
+    while idx < expr.len() {
+        let ch = expr[idx..].chars().next().unwrap();
+        if ch == '"' {
+            in_string = !in_string;
+            output.push(ch);
+            idx += ch.len_utf8();
+            continue;
+        }
+        if !in_string
+            && idx + name_len <= expr.len()
+            && expr[idx..idx + name_len].eq_ignore_ascii_case(name)
+            && expr[..idx]
+                .chars()
+                .next_back()
+                .map(|prev| !is_formula_identifier_char(prev))
+                .unwrap_or(true)
+            && expr[idx + name_len..]
+                .chars()
+                .next()
+                .map(|next| !is_formula_identifier_char(next))
+                .unwrap_or(true)
+        {
+            output.push_str(replacement);
+            idx += name_len;
+            continue;
+        }
+        output.push(ch);
+        idx += ch.len_utf8();
+    }
+
+    output
+}
+
+fn is_formula_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn formula_literal_for_value(value: &str) -> String {
+    if value.parse::<f64>().is_ok()
+        || value.eq_ignore_ascii_case("TRUE")
+        || value.eq_ignore_ascii_case("FALSE")
+        || (value.starts_with('"') && value.ends_with('"'))
+    {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    }
+}
+
+fn average(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f64>() / values.len() as f64
+    }
+}
+
 fn split_args(args: &str) -> Vec<String> {
     let mut result = Vec::new();
     let mut start = 0usize;
     let mut depth = 0usize;
+    let mut brace_depth = 0usize;
     let mut in_string = false;
 
     for (idx, ch) in args.char_indices() {
@@ -9341,7 +11025,11 @@ fn split_args(args: &str) -> Vec<String> {
             depth += 1;
         } else if !in_string && ch == ')' {
             depth = depth.saturating_sub(1);
-        } else if !in_string && depth == 0 && ch == ',' {
+        } else if !in_string && ch == '{' {
+            brace_depth += 1;
+        } else if !in_string && ch == '}' {
+            brace_depth = brace_depth.saturating_sub(1);
+        } else if !in_string && depth == 0 && brace_depth == 0 && ch == ',' {
             result.push(args[start..idx].trim().to_string());
             start = idx + 1;
         }
@@ -9349,6 +11037,420 @@ fn split_args(args: &str) -> Vec<String> {
 
     result.push(args[start..].trim().to_string());
     result
+}
+
+fn is_array_literal(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with('{') && value.ends_with('}')
+}
+
+fn array_literal_values(value: &str) -> Vec<String> {
+    let value = value.trim();
+    if !is_array_literal(value) {
+        return Vec::new();
+    }
+    value[1..value.len() - 1]
+        .split([';', ','])
+        .map(|item| strip_quotes(item.trim()))
+        .collect()
+}
+
+fn array_literal_matrix(value: &str) -> Vec<Vec<String>> {
+    let value = value.trim();
+    if !is_array_literal(value) {
+        return Vec::new();
+    }
+    split_array_literal_rows(&value[1..value.len() - 1])
+        .into_iter()
+        .map(|row| {
+            split_array_literal_cols(&row)
+                .into_iter()
+                .map(|item| strip_quotes(item.trim()))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn split_array_literal_rows(value: &str) -> Vec<String> {
+    split_array_literal_top_level(value, ';')
+}
+
+fn split_array_literal_cols(value: &str) -> Vec<String> {
+    split_array_literal_top_level(value, ',')
+}
+
+fn split_array_literal_top_level(value: &str, delimiter: char) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut start = 0usize;
+    let mut in_string = false;
+    for (idx, ch) in value.char_indices() {
+        if ch == '"' {
+            in_string = !in_string;
+        } else if !in_string && ch == delimiter {
+            result.push(value[start..idx].trim().to_string());
+            start = idx + ch.len_utf8();
+        }
+    }
+    result.push(value[start..].trim().to_string());
+    result
+}
+
+fn evaluate_formula_spill_matrix(
+    formula: &str,
+    default_sheet: &str,
+    cells: &HashMap<Key, String>,
+) -> PyResult<Option<Vec<Vec<String>>>> {
+    let expr = formula.trim().trim_start_matches('=').trim();
+    if is_array_literal(expr) {
+        return Ok(Some(array_literal_matrix(expr)));
+    }
+    if expr.contains(':') && find_top_level_operator(expr, ":").is_some() {
+        let matrix = range_matrix_or_literal(expr, default_sheet, cells);
+        if !matrix.is_empty() {
+            return Ok(Some(matrix));
+        }
+    }
+
+    if let Some(call) = whole_function_call(expr, "FILTER") {
+        let args = split_args(&call.args);
+        if args.len() < 2 || args.len() > 3 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: FILTER expects array, include, and optional if_empty",
+            ));
+        }
+        let values = range_matrix_or_literal(&args[0], default_sheet, cells);
+        let include = filter_include_mask(&args[1], default_sheet, cells, values.len())?;
+        let filtered: Vec<Vec<String>> = values
+            .into_iter()
+            .zip(include)
+            .filter_map(|(row, keep)| keep.then_some(row))
+            .collect();
+        if filtered.is_empty() && args.len() == 3 {
+            return Ok(Some(vec![vec![evaluate_text_arg(
+                &args[2],
+                default_sheet,
+                cells,
+            )?]]));
+        }
+        return Ok(Some(filtered));
+    }
+    if let Some(call) = whole_function_call(expr, "UNIQUE") {
+        let args = split_args(&call.args);
+        if args.is_empty() || args.len() > 3 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: UNIQUE expects array plus optional flags",
+            ));
+        }
+        if args
+            .get(1)
+            .map(|arg| truthy_formula_value(arg))
+            .unwrap_or(false)
+        {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: UNIQUE by_col is not supported in the current MVP evaluator",
+            ));
+        }
+        let exactly_once = args
+            .get(2)
+            .map(|arg| truthy_formula_value(arg))
+            .unwrap_or(false);
+        return Ok(Some(unique_matrix(
+            range_matrix_or_literal(&args[0], default_sheet, cells),
+            exactly_once,
+        )));
+    }
+    if let Some(call) = whole_function_call(expr, "SORTBY") {
+        let args = split_args(&call.args);
+        if args.len() < 2 || (args.len() != 2 && args.len() % 2 != 1) {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: SORTBY expects array plus by_array/sort_order pairs",
+            ));
+        }
+        let mut sorters = Vec::new();
+        for pair in args[1..].chunks(2) {
+            let sort_order = if pair.len() == 2 {
+                evaluate_numeric_arg(&pair[1], default_sheet, cells)?
+            } else {
+                1.0
+            };
+            if sort_order != 1.0 && sort_order != -1.0 {
+                return Err(PyValueError::new_err(
+                    "unsupported_formula: SORTBY sort_order must be 1 or -1",
+                ));
+            }
+            sorters.push((
+                matrix_first_column(range_matrix_or_literal(&pair[0], default_sheet, cells)),
+                sort_order < 0.0,
+            ));
+        }
+        return Ok(Some(sortby_matrix(
+            range_matrix_or_literal(&args[0], default_sheet, cells),
+            &sorters,
+        )));
+    }
+    if let Some(call) = whole_function_call(expr, "SORT") {
+        let args = split_args(&call.args);
+        if args.is_empty() || args.len() > 4 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: SORT expects array plus optional sort arguments",
+            ));
+        }
+        let sort_index = args
+            .get(1)
+            .map(|arg| evaluate_numeric_arg(arg, default_sheet, cells))
+            .transpose()?
+            .unwrap_or(1.0);
+        if sort_index < 1.0 {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: SORT sort_index must be positive",
+            ));
+        }
+        let descending = args
+            .get(2)
+            .map(|arg| evaluate_numeric_arg(arg, default_sheet, cells))
+            .transpose()?
+            .map(|order| {
+                if order == 1.0 || order == -1.0 {
+                    Ok(order < 0.0)
+                } else {
+                    Err(PyValueError::new_err(
+                        "unsupported_formula: SORT sort_order must be 1 or -1",
+                    ))
+                }
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if args
+            .get(3)
+            .map(|arg| truthy_formula_value(arg))
+            .unwrap_or(false)
+        {
+            return Err(PyValueError::new_err(
+                "unsupported_formula: SORT by_col is not supported in the current MVP evaluator",
+            ));
+        }
+        return Ok(Some(sort_matrix(
+            range_matrix_or_literal(&args[0], default_sheet, cells),
+            sort_index as usize,
+            descending,
+        )));
+    }
+
+    Ok(None)
+}
+
+fn whole_function_call(expr: &str, function_name: &str) -> Option<FunctionCall> {
+    let call = find_function_call(expr, function_name)?;
+    (call.start == 0 && call.end == expr.len()).then_some(call)
+}
+
+fn range_values_or_literal(
+    range: &str,
+    default_sheet: &str,
+    cells: &HashMap<Key, String>,
+) -> Vec<(Key, String)> {
+    let stripped = strip_quotes(range);
+    if stripped != range.trim() && stripped.contains(',') {
+        return stripped
+            .split(',')
+            .enumerate()
+            .map(|(idx, value)| {
+                (
+                    Key {
+                        sheet: default_sheet.to_string(),
+                        row: idx + 1,
+                        col: 1,
+                    },
+                    value.trim().to_string(),
+                )
+            })
+            .collect();
+    }
+    if is_array_literal(range) {
+        return array_literal_values(range)
+            .into_iter()
+            .enumerate()
+            .map(|(idx, value)| {
+                (
+                    Key {
+                        sheet: default_sheet.to_string(),
+                        row: idx + 1,
+                        col: 1,
+                    },
+                    value,
+                )
+            })
+            .collect();
+    }
+    let values = range_values(range, default_sheet, cells);
+    if !values.is_empty() {
+        return values;
+    }
+    if range.contains(',') {
+        return range
+            .split(',')
+            .enumerate()
+            .map(|(idx, value)| {
+                (
+                    Key {
+                        sheet: default_sheet.to_string(),
+                        row: idx + 1,
+                        col: 1,
+                    },
+                    strip_quotes(value),
+                )
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
+fn range_matrix_or_literal(
+    range: &str,
+    default_sheet: &str,
+    cells: &HashMap<Key, String>,
+) -> Vec<Vec<String>> {
+    let stripped = strip_quotes(range);
+    if stripped != range.trim() && stripped.contains(',') {
+        return vec![stripped
+            .split(',')
+            .map(|value| value.trim().to_string())
+            .collect()];
+    }
+    if is_array_literal(range) {
+        return array_literal_matrix(range);
+    }
+    if let Some(keys) = expand_range(range, default_sheet, cells) {
+        return keys_to_matrix(keys, cells);
+    }
+    if let Some(key) = parse_ref(range, default_sheet) {
+        return vec![vec![cells.get(&key).cloned().unwrap_or_default()]];
+    }
+    if range.contains(',') {
+        return vec![range.split(',').map(strip_quotes).collect()];
+    }
+    Vec::new()
+}
+
+fn keys_to_matrix(mut keys: Vec<Key>, cells: &HashMap<Key, String>) -> Vec<Vec<String>> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    keys.sort_by_key(|key| (key.row, key.col));
+    let rows: Vec<usize> = {
+        let mut rows = keys.iter().map(|key| key.row).collect::<Vec<_>>();
+        rows.sort();
+        rows.dedup();
+        rows
+    };
+    let cols: Vec<usize> = {
+        let mut cols = keys.iter().map(|key| key.col).collect::<Vec<_>>();
+        cols.sort();
+        cols.dedup();
+        cols
+    };
+    let key_set: HashSet<Key> = keys.into_iter().collect();
+    rows.into_iter()
+        .map(|row| {
+            cols.iter()
+                .map(|col| {
+                    let key = Key {
+                        sheet: key_set
+                            .iter()
+                            .find(|item| item.row == row && item.col == *col)
+                            .map(|item| item.sheet.clone())
+                            .unwrap_or_default(),
+                        row,
+                        col: *col,
+                    };
+                    if key.sheet.is_empty() || !key_set.contains(&key) {
+                        String::new()
+                    } else {
+                        cells.get(&key).cloned().unwrap_or_default()
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn matrix_cached_value(matrix: &[Vec<String>]) -> String {
+    matrix
+        .iter()
+        .flat_map(|row| row.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn matrix_first_column(matrix: Vec<Vec<String>>) -> Vec<String> {
+    matrix
+        .into_iter()
+        .map(|row| row.into_iter().next().unwrap_or_default())
+        .collect()
+}
+
+fn unique_matrix(matrix: Vec<Vec<String>>, exactly_once: bool) -> Vec<Vec<String>> {
+    let mut counts: HashMap<Vec<String>, usize> = HashMap::new();
+    for row in &matrix {
+        *counts.entry(row.clone()).or_insert(0) += 1;
+    }
+    let mut seen = HashSet::new();
+    matrix
+        .into_iter()
+        .filter(|row| seen.insert(row.clone()) && (!exactly_once || counts.get(row) == Some(&1)))
+        .collect()
+}
+
+fn sort_matrix(
+    mut matrix: Vec<Vec<String>>,
+    sort_index: usize,
+    descending: bool,
+) -> Vec<Vec<String>> {
+    let sort_idx = sort_index.saturating_sub(1);
+    matrix.sort_by(|left, right| {
+        compare_sort_values(
+            left.get(sort_idx).map(String::as_str).unwrap_or(""),
+            right.get(sort_idx).map(String::as_str).unwrap_or(""),
+        )
+    });
+    if descending {
+        matrix.reverse();
+    }
+    matrix
+}
+
+fn sortby_matrix(matrix: Vec<Vec<String>>, sorters: &[(Vec<String>, bool)]) -> Vec<Vec<String>> {
+    let mut pairs: Vec<(usize, Vec<String>)> = matrix.into_iter().enumerate().collect();
+    pairs.sort_by(|left, right| {
+        for (values, descending) in sorters {
+            let ordering = compare_sort_values(
+                values.get(left.0).map(String::as_str).unwrap_or(""),
+                values.get(right.0).map(String::as_str).unwrap_or(""),
+            );
+            if ordering != std::cmp::Ordering::Equal {
+                return if *descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                };
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    pairs.into_iter().map(|(_, row)| row).collect()
+}
+
+fn text_values_arg(
+    arg: &str,
+    default_sheet: &str,
+    cells: &HashMap<Key, String>,
+) -> PyResult<Vec<String>> {
+    let values = range_values_or_literal(arg, default_sheet, cells);
+    if !values.is_empty() {
+        return Ok(values.into_iter().map(|(_, value)| value).collect());
+    }
+    Ok(vec![evaluate_text_arg(arg, default_sheet, cells)?])
 }
 
 fn range_values(
@@ -9420,6 +11522,67 @@ fn criteria_matches(value: &str, criteria: &str) -> bool {
     value == criteria
 }
 
+fn filter_include_mask(
+    include: &str,
+    default_sheet: &str,
+    cells: &HashMap<Key, String>,
+    expected_len: usize,
+) -> PyResult<Vec<bool>> {
+    for op in [">=", "<=", "<>", ">", "<", "="] {
+        if let Some(idx) = find_top_level_operator(include, op) {
+            let left_values = range_values_or_literal(&include[..idx], default_sheet, cells);
+            let criteria = evaluate_text_arg(&include[idx + op.len()..], default_sheet, cells)?;
+            return Ok((0..expected_len)
+                .map(|row_idx| {
+                    let value = left_values
+                        .get(row_idx)
+                        .map(|(_, value)| value.as_str())
+                        .unwrap_or("");
+                    compare_criteria(value, op, &criteria)
+                })
+                .collect());
+        }
+    }
+    let values = range_values_or_literal(include, default_sheet, cells);
+    if values.is_empty() {
+        let keep = evaluate_condition(include, default_sheet, cells)?;
+        return Ok(vec![keep; expected_len]);
+    }
+    Ok((0..expected_len)
+        .map(|idx| {
+            values
+                .get(idx)
+                .map(|(_, value)| truthy_formula_value(value))
+                .unwrap_or(false)
+        })
+        .collect())
+}
+
+fn find_top_level_operator(expr: &str, op: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let bytes = expr.as_bytes();
+    let op_bytes = op.as_bytes();
+    let mut idx = 0usize;
+    while idx + op_bytes.len() <= bytes.len() {
+        let ch = expr[idx..].chars().next()?;
+        if ch == '"' {
+            in_string = !in_string;
+        } else if !in_string && ch == '(' {
+            depth += 1;
+        } else if !in_string && ch == ')' {
+            depth = depth.saturating_sub(1);
+        } else if !in_string
+            && depth == 0
+            && bytes[idx..idx + op_bytes.len()].eq_ignore_ascii_case(op_bytes)
+        {
+            return Some(idx);
+        }
+        idx += ch.len_utf8();
+    }
+    None
+}
+
 fn compare_criteria(value: &str, op: &str, rhs: &str) -> bool {
     let rhs = strip_quotes(rhs);
     let left_num = value.parse::<f64>();
@@ -9441,6 +11604,26 @@ fn compare_criteria(value: &str, op: &str, rhs: &str) -> bool {
         "=" => value == rhs,
         _ => false,
     }
+}
+
+fn compare_sort_values(left: &str, right: &str) -> std::cmp::Ordering {
+    match (left.parse::<f64>(), right.parse::<f64>()) {
+        (Ok(left_num), Ok(right_num)) => left_num
+            .partial_cmp(&right_num)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        _ => left.cmp(right),
+    }
+}
+
+fn truthy_formula_value(value: &str) -> bool {
+    let value = strip_quotes(value);
+    if value.eq_ignore_ascii_case("TRUE") {
+        return true;
+    }
+    if value.eq_ignore_ascii_case("FALSE") || value.is_empty() {
+        return false;
+    }
+    value.parse::<f64>().map(|num| num != 0.0).unwrap_or(true)
 }
 
 fn expand_range(
