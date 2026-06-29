@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import uuid
+import zipfile
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any, BinaryIO
+from xml.etree import ElementTree as ET
 
 import sheet_shadow_core
 
@@ -140,6 +146,8 @@ class SheetShadowMcpServer:
                 payload = self.tool_store_status(arguments)
             elif name == "sheet_shadow_save":
                 payload = self.tool_save(arguments)
+            elif name == "sheet_shadow_delivery_gate":
+                payload = self.tool_delivery_gate(arguments)
             elif name == "sheet_shadow_diff_report":
                 payload = self.tool_diff_report(arguments)
             elif name == "sheet_shadow_status":
@@ -168,8 +176,14 @@ class SheetShadowMcpServer:
                 "file_path": file_path,
                 "tables": engine.sqlite_table_names(),
                 "meta_count": engine.shadow_meta_count(),
+                "workbook_status": engine.workbook_status(),
             },
-            completed=["workbook_ingested", "sqlite_projection_ready", "formula_dependencies_built"],
+            completed=[
+                "workbook_ingested",
+                "source_snapshot_recorded",
+                "sqlite_projection_ready",
+                "formula_dependencies_built",
+            ],
         )
 
     def tool_table_names(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -737,6 +751,147 @@ class SheetShadowMcpServer:
             completed=["workbook_saved"],
         )
 
+    def tool_delivery_gate(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        session = self.require_session(arguments)
+        output_path = require_save_path(arguments)
+        run_external_recalc = bool(arguments.get("run_external_recalc", False))
+        if same_existing_path(output_path, session.file_path):
+            raise ValueError(
+                f"save_path_error: output_path must not equal active workbook source path: {output_path}"
+            )
+        if not os.path.exists(output_path):
+            raise ValueError(f"delivery_gate_error: output workbook does not exist: {output_path}")
+
+        status = session.engine.workbook_status()
+        source_session_fresh = status.get("source_snapshot_state") == "fresh"
+        diff_report = session.engine.diff_report()
+        formula_scan = scan_xlsx_formula_errors(output_path)
+        package_drift = (
+            package_drift_report(session.file_path, output_path, diff_report)
+            if source_session_fresh
+            else empty_package_drift_report("skipped_stale_source")
+        )
+        diagnostics = dependency_diagnostics_for_events(session, diff_report)
+        not_completed = not_completed_from_diagnostics(diagnostics)
+        warnings: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        completed = [
+            "delivery_gate_ran",
+            "output_path_verified",
+            "formula_error_scan_completed",
+            "diff_manifest_collected",
+            "workbook_status_collected",
+        ]
+        if source_session_fresh:
+            completed.append("package_drift_checked")
+        else:
+            errors.append(
+                {
+                    "code": "stale_session",
+                    "message": status.get(
+                        "source_snapshot_detail",
+                        "Source workbook changed after ingest; re-ingest before delivery",
+                    ),
+                    "source_snapshot_state": status.get("source_snapshot_state", "unknown"),
+                }
+            )
+            not_completed.extend(["source_session_fresh", "package_drift_check"])
+
+        recalc_status = external_recalc_report(output_path, run_external_recalc)
+        if run_external_recalc:
+            if recalc_status["status"] == "completed":
+                completed.append("external_recalc_completed")
+                formula_scan = recalc_status["formula_scan"]
+            else:
+                warnings.append(
+                    {
+                        "code": f"external_recalc_{recalc_status['status']}",
+                        "severity": "warning",
+                        "message": recalc_status["message"],
+                        "not_completed": "external_recalc",
+                    }
+                )
+                not_completed.append("external_recalc")
+
+        if formula_scan["total_errors"]:
+            errors.append(
+                {
+                    "code": "formula_errors_found",
+                    "message": "Formula or cell error values were found in the saved workbook",
+                    "error_summary": formula_scan["error_summary"],
+                    "locations": formula_scan["error_locations"],
+                }
+            )
+            not_completed.append("zero_formula_errors")
+        else:
+            completed.append("zero_formula_errors")
+
+        if not diff_report:
+            warnings.append(
+                {
+                    "code": "empty_diff_manifest",
+                    "severity": "warning",
+                    "message": "No current Sheet Shadow diff/audit events were found for this session",
+                    "not_completed": "changed_manifest_review",
+                }
+            )
+            not_completed.append("changed_manifest_review")
+
+        if package_drift["unexpected_changed_entries"]:
+            warnings.append(
+                {
+                    "code": "unexpected_package_drift",
+                    "severity": "warning",
+                    "message": "Saved workbook contains package entry changes outside the expected diff surface",
+                    "not_completed": "unexpected_package_drift_review",
+                    "entries": package_drift["unexpected_changed_entries"],
+                }
+            )
+            not_completed.append("unexpected_package_drift_review")
+        else:
+            completed.append("no_unexpected_package_drift")
+
+        if package_drift["macro_drift_entries"]:
+            errors.append(
+                {
+                    "code": "macro_drift_detected",
+                    "message": "Macro/VBA package entries changed or disappeared during delivery",
+                    "entries": package_drift["macro_drift_entries"],
+                }
+            )
+            not_completed.append("macro_preservation")
+        else:
+            completed.append("macro_parts_preserved")
+
+        delivery_report = {
+            "status": delivery_status(errors, warnings, not_completed),
+            "source_path": session.file_path,
+            "output_path": output_path,
+            "output_exists": True,
+            "output_size_bytes": os.path.getsize(output_path),
+            "workbook_status": status,
+            "diff_event_count": len(diff_report),
+            "diff_event_types": sorted({str(event.get("event_type", "")) for event in diff_report}),
+            "formula_scan": formula_scan,
+            "recalc": recalc_status,
+            "package_drift": package_drift,
+            "policy_checks": {
+                "source_not_overwritten": True,
+                "existing_workbook_fidelity_save_path": True,
+                "openpyxl_pandas_core_save_path": False,
+                "source_session_fresh": source_session_fresh,
+                "no_unexpected_package_drift": not package_drift["unexpected_changed_entries"],
+                "macro_parts_preserved": not package_drift["macro_drift_entries"],
+            },
+        }
+        return operation_payload(
+            {"workbook_id": session.workbook_id, "delivery_report": delivery_report},
+            completed=completed,
+            not_completed=not_completed,
+            diagnostics=[*diagnostics, *warnings],
+            errors=errors,
+        )
+
     def tool_diff_report(self, arguments: dict[str, Any]) -> dict[str, Any]:
         session = self.require_session(arguments)
         diff_report = session.engine.diff_report()
@@ -1103,6 +1258,16 @@ def tool_specs() -> list[dict[str, Any]]:
                     "type": "string",
                     "enum": ["preserve", "update_unique", "auto"],
                 },
+            },
+            ["workbook_id", "output_path"],
+        ),
+        tool_spec(
+            "sheet_shadow_delivery_gate",
+            "Validate a saved output workbook with agent policy and delivery checks.",
+            {
+                "workbook_id": string_schema(),
+                "output_path": string_schema(),
+                "run_external_recalc": {"type": "boolean"},
             },
             ["workbook_id", "output_path"],
         ),
@@ -1688,6 +1853,394 @@ def meta_record_to_dict(meta: Any) -> dict[str, Any]:
     }
 
 
+EXCEL_ERROR_VALUES = {"#REF!", "#DIV/0!", "#VALUE!", "#N/A", "#NAME?", "#NULL!", "#NUM!"}
+MACRO_PACKAGE_PATTERNS = (
+    "xl/vbaProject.bin",
+    "xl/_rels/vbaProject.bin.rels",
+    "xl/vbaData.xml",
+)
+
+
+def scan_xlsx_formula_errors(output_path: str) -> dict[str, Any]:
+    sheet_names = workbook_sheet_names_by_path(output_path)
+    total_formulas = 0
+    error_summary: dict[str, dict[str, Any]] = {}
+    error_locations: list[dict[str, str]] = []
+
+    with zipfile.ZipFile(output_path) as archive:
+        worksheet_paths = sorted(
+            name
+            for name in archive.namelist()
+            if name.startswith("xl/worksheets/") and name.endswith(".xml")
+        )
+        for worksheet_path in worksheet_paths:
+            root = ET.fromstring(archive.read(worksheet_path))
+            sheet_name = sheet_names.get(worksheet_path, worksheet_path)
+            for cell in iter_elements_named(root, "c"):
+                formula = first_child_text(cell, "f")
+                value = first_child_text(cell, "v")
+                cell_type = cell.attrib.get("t", "")
+                if formula is not None:
+                    total_formulas += 1
+                error_value = None
+                if value in EXCEL_ERROR_VALUES:
+                    error_value = value
+                elif cell_type == "e":
+                    error_value = value or "#ERROR"
+                if error_value is None:
+                    continue
+                location = f"{sheet_name}!{cell.attrib.get('r', '')}"
+                item = error_summary.setdefault(error_value, {"count": 0, "locations": []})
+                item["count"] += 1
+                item["locations"].append(location)
+                error_locations.append(
+                    {
+                        "sheet": sheet_name,
+                        "cell": cell.attrib.get("r", ""),
+                        "error": error_value,
+                        "formula": formula or "",
+                    }
+                )
+
+    return {
+        "status": "success" if not error_locations else "errors_found",
+        "total_errors": len(error_locations),
+        "total_formulas": total_formulas,
+        "error_summary": error_summary,
+        "error_locations": error_locations,
+    }
+
+
+def delivery_status(
+    errors: list[dict[str, Any]],
+    warnings: list[dict[str, Any]],
+    not_completed: list[str],
+) -> str:
+    if errors:
+        return "failed"
+    if warnings or not_completed:
+        return "needs_review"
+    return "passed"
+
+
+def package_drift_report(source_path: str, output_path: str, diff_report: list[dict[str, Any]]) -> dict[str, Any]:
+    source_hashes = package_entry_hashes(source_path)
+    output_hashes = package_entry_hashes(output_path)
+    source_entries = set(source_hashes)
+    output_entries = set(output_hashes)
+    changed_entries = sorted(
+        entry
+        for entry in source_entries & output_entries
+        if source_hashes[entry] != output_hashes[entry]
+    )
+    missing_entries = sorted(source_entries - output_entries)
+    added_entries = sorted(output_entries - source_entries)
+    expected = expected_package_changes(source_path, diff_report)
+    unexpected_changed_entries = sorted(
+        entry
+        for entry in [*changed_entries, *missing_entries, *added_entries]
+        if not entry_change_expected(entry, expected)
+    )
+    macro_drift_entries = sorted(
+        entry
+        for entry in [*changed_entries, *missing_entries]
+        if is_macro_package_entry(entry)
+    )
+    return {
+        "changed_entries": changed_entries,
+        "missing_entries": missing_entries,
+        "added_entries": added_entries,
+        "expected_changed_entries": sorted(expected["entries"]),
+        "expected_changed_prefixes": sorted(expected["prefixes"]),
+        "unexpected_changed_entries": unexpected_changed_entries,
+        "macro_drift_entries": macro_drift_entries,
+    }
+
+
+def empty_package_drift_report(status: str) -> dict[str, Any]:
+    return {
+        "status": status,
+        "changed_entries": [],
+        "missing_entries": [],
+        "added_entries": [],
+        "expected_changed_entries": [],
+        "expected_changed_prefixes": [],
+        "unexpected_changed_entries": [],
+        "macro_drift_entries": [],
+    }
+
+
+def package_entry_hashes(path: str) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    with zipfile.ZipFile(path) as archive:
+        for name in archive.namelist():
+            if name.endswith("/"):
+                continue
+            hashes[name] = sha256(archive.read(name)).hexdigest()
+    return hashes
+
+
+def expected_package_changes(source_path: str, diff_report: list[dict[str, Any]]) -> dict[str, set[str]]:
+    sheet_paths = workbook_sheet_paths_by_name(source_path)
+    entries: set[str] = set()
+    prefixes: set[str] = set()
+    for event in diff_report:
+        event_type = str(event.get("event_type", ""))
+        sheet = event.get("sheet")
+        if isinstance(sheet, str) and sheet in sheet_paths:
+            entries.add(sheet_paths[sheet])
+            rel_path = worksheet_rels_path(sheet_paths[sheet])
+            if rel_path:
+                entries.add(rel_path)
+
+        if event_type in {"sheet_rename", "sheet_visibility_update", "defined_name_update"}:
+            entries.add("xl/workbook.xml")
+        if event_type == "style_update":
+            entries.add("xl/styles.xml")
+        if event_type in {"table_range_update"}:
+            prefixes.add("xl/tables/")
+        if event_type in {"comment_update"}:
+            prefixes.add("xl/comments")
+            prefixes.add("xl/threadedComments")
+            prefixes.add("xl/persons/")
+        if event_type in {
+            "drawing_anchor_update",
+            "drawing_object_update",
+            "drawing_image_replace",
+            "drawing_text_update",
+        }:
+            prefixes.add("xl/drawings/")
+            prefixes.add("xl/media/")
+        if event_type in {"chart_title_update", "chart_source_update"}:
+            prefixes.add("xl/charts/")
+            prefixes.add("xl/drawings/")
+        if event_type in {"sparkline_source_update", "sparkline_ref_update"}:
+            prefixes.add("xl/worksheets/")
+        if event_type == "pivot_metadata_update":
+            prefixes.add("xl/pivotTables/")
+        if event_type == "ole_object_replace":
+            prefixes.add("xl/embeddings/")
+    return {"entries": entries, "prefixes": prefixes}
+
+
+def workbook_sheet_paths_by_name(path: str) -> dict[str, str]:
+    return {name: sheet_path for sheet_path, name in workbook_sheet_names_by_path(path).items()}
+
+
+def worksheet_rels_path(sheet_path: str) -> str:
+    if not sheet_path.startswith("xl/worksheets/"):
+        return ""
+    return sheet_path.replace("xl/worksheets/", "xl/worksheets/_rels/") + ".rels"
+
+
+def entry_change_expected(entry: str, expected: dict[str, set[str]]) -> bool:
+    if entry in expected["entries"]:
+        return True
+    return any(entry.startswith(prefix) for prefix in expected["prefixes"])
+
+
+def is_macro_package_entry(entry: str) -> bool:
+    return entry in MACRO_PACKAGE_PATTERNS or entry.startswith("xl/vba")
+
+
+def external_recalc_report(output_path: str, requested: bool) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "requested": requested,
+        "status": "skipped",
+        "oracle": "libreoffice_headless",
+        "message": "",
+    }
+    if not requested:
+        return report
+
+    soffice = find_soffice()
+    if soffice is None:
+        report.update(
+            {
+                "status": "unavailable",
+                "message": "LibreOffice soffice binary was not found",
+            }
+        )
+        return report
+
+    version = get_libreoffice_version(soffice)
+    with tempfile.TemporaryDirectory(prefix="sheet_shadow_recalc_") as tmpdir:
+        input_dir = os.path.join(tmpdir, "input")
+        output_dir = os.path.join(tmpdir, "output")
+        profile_dir = os.path.join(tmpdir, "profile")
+        os.makedirs(input_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(profile_dir, exist_ok=True)
+        temp_input = os.path.join(input_dir, os.path.basename(output_path))
+        shutil.copy2(output_path, temp_input)
+        cmd = [
+            soffice,
+            "--headless",
+            "--norestore",
+            "--nolockcheck",
+            "--nodefault",
+            "--nofirststartwizard",
+            f"-env:UserInstallation=file://{profile_dir}",
+            "--infilter=Calc MS Excel 2007 XML",
+            "--convert-to",
+            "xlsx",
+            "--outdir",
+            output_dir,
+            temp_input,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            report.update(
+                {
+                    "status": "timeout",
+                    "message": "LibreOffice timed out after 60s",
+                    "soffice": soffice,
+                    "version": version,
+                }
+            )
+            return report
+        except OSError as exc:
+            report.update(
+                {
+                    "status": "failed",
+                    "message": str(exc),
+                    "soffice": soffice,
+                    "version": version,
+                }
+            )
+            return report
+
+        stdout = result.stdout.decode(errors="replace").strip()
+        stderr = result.stderr.decode(errors="replace").strip()
+        if result.returncode != 0:
+            report.update(
+                {
+                    "status": "failed",
+                    "message": f"LibreOffice exited with code {result.returncode}",
+                    "soffice": soffice,
+                    "version": version,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                }
+            )
+            return report
+
+        recalc_path = os.path.join(output_dir, os.path.basename(output_path))
+        if not os.path.exists(recalc_path):
+            xlsx_files = [
+                os.path.join(output_dir, name)
+                for name in os.listdir(output_dir)
+                if name.endswith(".xlsx")
+            ]
+            if xlsx_files:
+                recalc_path = xlsx_files[0]
+        if not os.path.exists(recalc_path):
+            report.update(
+                {
+                    "status": "failed",
+                    "message": "LibreOffice completed but no recalculated .xlsx output was found",
+                    "soffice": soffice,
+                    "version": version,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "output_dir_files": sorted(os.listdir(output_dir)),
+                }
+            )
+            return report
+
+        report.update(
+            {
+                "status": "completed",
+                "message": "LibreOffice recalculation completed on a temporary output copy",
+                "soffice": soffice,
+                "version": version,
+                "stdout": stdout,
+                "stderr": stderr,
+                "formula_scan": scan_xlsx_formula_errors(recalc_path),
+            }
+        )
+        return report
+
+
+def find_soffice() -> str | None:
+    candidates = [
+        "soffice",
+        "libreoffice",
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+    ]
+    for candidate in candidates:
+        found = shutil.which(candidate)
+        if found:
+            return found
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def get_libreoffice_version(soffice: str) -> str:
+    try:
+        result = subprocess.run([soffice, "--version"], capture_output=True, timeout=10)
+    except Exception:
+        return "unknown"
+    return result.stdout.decode(errors="replace").strip() or "unknown"
+
+
+def workbook_sheet_names_by_path(output_path: str) -> dict[str, str]:
+    with zipfile.ZipFile(output_path) as archive:
+        if "xl/workbook.xml" not in archive.namelist():
+            return {}
+        workbook_root = ET.fromstring(archive.read("xl/workbook.xml"))
+        rels_by_id: dict[str, str] = {}
+        if "xl/_rels/workbook.xml.rels" in archive.namelist():
+            rels_root = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+            for rel in rels_root:
+                rel_id = rel.attrib.get("Id")
+                target = rel.attrib.get("Target")
+                if rel_id and target:
+                    rels_by_id[rel_id] = normalize_workbook_target(target)
+
+    names: dict[str, str] = {}
+    for sheet in iter_elements_named(workbook_root, "sheet"):
+        rel_id = attr_by_local_name(sheet, "id")
+        name = sheet.attrib.get("name")
+        if rel_id and name and rel_id in rels_by_id:
+            names[rels_by_id[rel_id]] = name
+    return names
+
+
+def normalize_workbook_target(target: str) -> str:
+    if target.startswith("/"):
+        normalized = target.lstrip("/")
+    else:
+        normalized = os.path.normpath(os.path.join("xl", target))
+    return normalized.replace(os.sep, "/")
+
+
+def iter_elements_named(root: ET.Element, name: str):
+    for element in root.iter():
+        if local_name(element.tag) == name:
+            yield element
+
+
+def first_child_text(element: ET.Element, name: str) -> str | None:
+    for child in element:
+        if local_name(child.tag) == name:
+            return child.text or ""
+    return None
+
+
+def attr_by_local_name(element: ET.Element, name: str) -> str | None:
+    for key, value in element.attrib.items():
+        if local_name(key) == name:
+            return value
+    return None
+
+
+def local_name(name: str) -> str:
+    return name.rsplit("}", 1)[-1]
+
+
 def error_response(request_id: Any, code: int, message: str) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
@@ -1708,6 +2261,8 @@ def error_payload(exc: Exception) -> dict[str, Any]:
             "unsafe_update",
             "unknown_sheet",
             "invalid_cell_ref",
+            "delivery_gate_error",
+            "stale_session",
             "save_path_error",
             "store_path_error",
             "store_schema_error",
@@ -1732,6 +2287,8 @@ def not_completed_for_error_code(code: str) -> list[str]:
         "unsafe_update": ["requested_update"],
         "unknown_sheet": ["requested_operation"],
         "invalid_cell_ref": ["requested_operation"],
+        "delivery_gate_error": ["delivery_gate"],
+        "stale_session": ["stale_session_reingest_required"],
         "save_path_error": ["workbook_save"],
         "store_path_error": ["store_access"],
         "store_schema_error": ["store_schema_read"],

@@ -56,7 +56,7 @@ Sheet Shadow reads an existing `.xlsx` file and builds a controlled in-memory `W
 
 Sheet Shadow 会读取已有 `.xlsx` 文件，建立一个受控的内存 `WorkbookShadow`。Agent 可以先检查 workbook、预览修改、执行语义操作，然后保存一个新的副本，而不是粗暴重写整个文件。
 
-### Current Features: V1 + V2 / 当前功能：V1 + V2
+### Current Features: V1 + V2 + V3 / 当前功能：V1 + V2 + V3
 
 - Workbook ingest: read sheets, cells, formulas, raw values, display values, metadata, and workbook structure.
 - Shadow model: keep an agent-facing model separate from the original workbook package.
@@ -73,6 +73,10 @@ Sheet Shadow 会读取已有 `.xlsx` 文件，建立一个受控的内存 `Workb
 - Drawing and object inventory: inspect drawings, images, charts, shapes, pivot metadata, sparklines, and embedded package objects.
 - Narrow object writes: support selected image/chart/shape edits, sparkline source updates, pivot metadata updates, and replacement of existing embedded package bytes.
 - Audit scripts: scan real workbooks for advanced Excel objects and run smoke checks on candidate files.
+- Delivery gate: validate a saved workbook before handoff with output/source safety checks, workbook status, diff manifest, formula-error scan, package drift review, Macro/VBA drift blocking, and optional external recalculation.
+- Stale-session guard: detect when the source workbook changed after ingest and refuse saving from an old shadow session.
+- Formula compatibility expansion: support a bounded formula MVP including conditional averages, date helpers, exact-match lookups, structured references, defined names, `LET`, immediately invoked `LAMBDA`, array literals, and row-oriented dynamic arrays with bounded spill/writeback.
+- Large-workbook ingest performance: compress broad range dependencies into row-bounded dependency edges and cache hot dependency regexes, reducing a real 24-sheet workbook ingest from roughly 35 seconds to about 5 seconds in local development testing.
 
 对应中文总结：
 
@@ -91,6 +95,10 @@ Sheet Shadow 会读取已有 `.xlsx` 文件，建立一个受控的内存 `Workb
 - 对象清单：检查 drawing、image、chart、shape、pivot metadata、sparkline、embedded package object。
 - 窄范围对象写入：支持部分 image/chart/shape 编辑、sparkline source 更新、pivot metadata 更新、已有 embedded package bytes 替换。
 - 审计脚本：扫描真实 workbook 里的高级 Excel 对象，并对候选文件做 smoke check。
+- 交付 gate：保存后检查 output/source 安全、workbook 状态、diff manifest、公式错误、package drift、Macro/VBA drift，并可选择外部重算。
+- stale-session 防护：如果源 workbook 在 ingest 之后被外部改过，拒绝继续从旧 shadow session 保存。
+- 公式兼容扩展：支持有边界的公式 MVP，包括 conditional averages、date helpers、exact-match lookup、structured refs、defined names、`LET`、立即调用的 `LAMBDA`、array literal，以及 row-oriented dynamic arrays 和 bounded spill/writeback。
+- 大 workbook ingest 性能：用 row-bounded dependency edge 压缩大范围依赖，并缓存热点 regex；本地开发测试中，真实 24-sheet workbook ingest 从约 35 秒降到约 5 秒。
 
 ---
 
@@ -106,6 +114,9 @@ Sheet Shadow 刻意保持谨慎。它不是假装所有 Excel 特性都能轻松
 - It does not use SQLite or MCP as the workbook truth; the truth is the original Excel package plus the active shadow model.
 - It saves to a new workbook copy and avoids destructive in-place overwrite by default.
 - It supports selected advanced objects, but complex pivot caches, drawing relationships, external links, macros, and unusual embedded objects still need careful validation.
+- It does not claim full Excel formula compatibility; unsupported or risky formulas must remain visible through diagnostics instead of being silently guessed.
+- It does not silently merge external workbook edits into an old session; re-ingest the workbook after outside tools modify it.
+- It does not currently use lazy or bounded sheet loading. Whole-workbook ingest remains the default because dependency completeness is part of the safety model.
 - It is a public learning/research release; important workbooks should always be tested on copies first.
 
 边界也必须讲清楚：
@@ -116,6 +127,9 @@ Sheet Shadow 刻意保持谨慎。它不是假装所有 Excel 特性都能轻松
 - 它不把 SQLite 或 MCP 当成 workbook 真源；真源仍然是原始 Excel package 加 active shadow model。
 - 它默认保存新副本，避免破坏性原地覆盖。
 - 它支持部分高级对象，但复杂 pivot cache、drawing relationship、external link、macro 和非常规 embedded object 仍然需要谨慎验证。
+- 它不声称完整兼容 Excel 公式；不支持或高风险公式必须通过 diagnostics 暴露，不能静默猜测。
+- 它不会把外部工具对 workbook 的修改静默合并进旧 session；外部工具改过之后需要重新 ingest。
+- 当前不使用 lazy 或 bounded sheet loading。默认仍然 ingest 整个 workbook，因为完整依赖关系是安全模型的一部分。
 - 这是公开学习/研究版本，重要 workbook 一定要先在副本上测试。
 
 ---
@@ -134,23 +148,27 @@ Sheet Shadow 和 OfficeCLI 不是互相替代，而是侧重点不同：
 
 | Topic | OfficeCLI | Sheet Shadow |
 | --- | --- | --- |
-| Main goal | General Office automation across Word, Excel, and PowerPoint | Agent-safe editing of existing Excel workbooks |
+| Main goal | General Office automation across Word, Excel, and PowerPoint | Agent-safe editing and delivery validation for existing Excel workbooks |
 | File types | `.docx`, `.xlsx`, `.pptx` | `.xlsx` |
 | Best for | Creating, inspecting, formatting, validating, and modifying Office documents through a broad CLI | Previewing and applying controlled workbook edits with diagnostics and targeted package patching |
-| Agent safety model | Layered CLI operations, validation, raw XML escape hatch when needed | Shadow model first, semantic operations, diff/diagnostics, narrow writes |
+| Agent safety model | Layered CLI operations, validation, raw XML escape hatch when needed | Shadow model first, semantic operations, diff/diagnostics, narrow writes, delivery gate |
+| Delivery check | Usually composed by the caller from validate/open/recalc/diff steps | Built-in delivery report with formula-error scan, package drift review, source freshness, and Macro/VBA drift blocking |
 | Excel focus | Broad Excel command coverage as part of an Office suite | Deep workbook-preservation workflow for existing Excel packages |
 | Truth model | Office document manipulated through CLI paths and commands | Original workbook package plus `WorkbookShadow`; SQLite/MCP are interfaces, not truth |
+| External edits | Caller manages file version and conflict policy | Source snapshot freshness is checked; stale sessions must re-ingest before save |
 | Philosophy | Give agents a powerful Office toolbelt | Give agents guardrails before touching a fragile workbook |
 
 In practice, a learning agent project can use both ideas:
 
 - Use OfficeCLI when the task is broad Office automation, document generation, formatting, or cross-format work.
 - Use Sheet Shadow when the task is specifically about safely editing an existing Excel workbook and understanding the consequences before saving.
+- Re-ingest with Sheet Shadow after OfficeCLI, Excel, LibreOffice, or another tool changes the workbook externally.
 
 实际使用时，两者可以互补：
 
 - 如果任务是广义 Office 自动化、文档生成、格式调整、跨 Word/Excel/PPT 工作，OfficeCLI 很合适。
 - 如果任务是安全修改已有 Excel workbook，并且必须在保存前理解影响范围，Sheet Shadow 更专注。
+- 如果 OfficeCLI、Excel、LibreOffice 或其他工具在外部改过 workbook，继续用 Sheet Shadow 前需要重新 ingest。
 
 ---
 
