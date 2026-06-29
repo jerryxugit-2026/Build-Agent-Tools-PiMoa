@@ -172,6 +172,42 @@ In practice, a learning agent project can use both ideas:
 
 ---
 
+## Sheet Shadow and xlsx Skills / 与 xlsx Skill 的关系
+
+Claude-style xlsx Skills are extremely useful because they turn spreadsheet experience into a reusable agent playbook: use formulas instead of hardcoded derived numbers, preserve existing workbooks, avoid unsafe round-trips, inspect formulas and cached values carefully, and validate before delivery.
+
+Sheet Shadow was influenced by that same direction, but it moves part of the checklist from instructions into runtime behavior.
+
+| Topic | Claude-style xlsx Skill | Sheet Shadow V3 |
+| --- | --- | --- |
+| Shape | Agent playbook with instructions, helper scripts, and validation habits | MCP/runtime layer with structured sessions, edits, diagnostics, and delivery reports |
+| Existing workbook safety | Tells the agent not to recreate or flatten the workbook | Uses `WorkbookShadow`, source snapshots, targeted package patching, and stale-session rejection |
+| Formula safety | Tells the agent to check formulas, cached values, and error cells | Tracks dependencies, recalculates supported formulas, reports unsupported formulas, and scans saved workbooks for Excel error values |
+| Delivery | A checklist the agent must remember to run | `sheet_shadow_delivery_gate` returns `passed`, `needs_review`, or `failed` with machine-readable details |
+| Scope | Broad spreadsheet workflow: read, analyze, create, edit, repair, validate | Narrower: safe semantic editing of existing `.xlsx` files |
+
+The best way to think about it:
+
+> xlsx Skills teach the agent how to behave around spreadsheets. Sheet Shadow gives the agent a safer spreadsheet runtime to behave through.
+
+Claude-style xlsx Skill 很有价值，因为它把 spreadsheet 经验变成可复用的 Agent 操作手册：尽量写公式而不是硬编码结果、保护已有 workbook、避免不安全 round-trip、仔细检查公式和 cached values、交付前验证。
+
+Sheet Shadow 受这个方向启发，但它把一部分 checklist 从“提示词要求”下沉到了运行时。
+
+| 维度 | Claude-style xlsx Skill | Sheet Shadow V3 |
+| --- | --- | --- |
+| 形态 | Agent 操作手册、helper scripts、验证习惯 | MCP/runtime 层，提供结构化 session、edit、diagnostics、delivery report |
+| 既有 workbook 安全 | 告诉 Agent 不要重建或 flatten workbook | 使用 `WorkbookShadow`、source snapshot、targeted package patch、stale-session rejection |
+| 公式安全 | 提醒 Agent 检查 formula、cached value、error cell | 跟踪依赖、重算支持范围内的公式、报告 unsupported formula、扫描保存后的 Excel error value |
+| 交付 | 需要 Agent 记得执行 checklist | `sheet_shadow_delivery_gate` 返回 `passed`、`needs_review` 或 `failed`，并带机器可读细节 |
+| 范围 | 更宽：read、analyze、create、edit、repair、validate | 更窄：安全语义编辑已有 `.xlsx` |
+
+一句话：
+
+> xlsx Skill 教 Agent 怎样谨慎处理 spreadsheet；Sheet Shadow 给 Agent 一个更安全的 spreadsheet runtime。
+
+---
+
 ## Why It Matters / 为什么意义很大
 
 This project matters because Excel is everywhere.
