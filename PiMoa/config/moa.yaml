@@ -1,0 +1,55 @@
+# Pi-MoA 配置（真源，对齐 DESIGN.md §4.5）。
+# 铁律：模型集/聚合器/endpoint/profile/quorum 全在配置里，代码只读配置。
+# 加载期不变量强校验见 src/config/load.ts（fail-loud）。
+# key 名与 src/config/types.ts（钉死契约）一一对应（camelCase）。
+#
+# 端点分散（徐总 2026-07-24）：不把三模型都压在 CLIProxy 上（依赖过强+它有 SOCKS 抖动）。
+#   gpt-5.5 走本地 CLIProxy；minimax / xiaomi 直连各自官方 endpoint。全程零 OpenRouter。
+
+# 供给方 endpoint（与模型解耦，改 endpoint 不动 preset）。
+# api_key 走 env 引用，绝不落配置明文。
+providers:
+  cliproxy:
+    kind: openai
+    baseUrl: "http://127.0.0.1:8317/v1"
+    apiKeyEnv: CLIPROXY_API_KEY
+  minimax:
+    kind: anthropic # api.minimaxi.com/anthropic = Anthropic 协议（models.json api: anthropic-messages）
+    baseUrl: "https://api.minimaxi.com/anthropic"
+    apiKeyEnv: MINIMAX_API_KEY
+  xiaomi:
+    kind: openai
+    baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1"
+    apiKeyEnv: XIAOMI_API_KEY
+
+# 命名 preset（可自由增删多套组合，无需改代码）。
+presets:
+  # default = synthesize：2 proposer → aggregator，2/2 quorum，聚合正文即最终答案。
+  default:
+    mode: synthesize
+    quorum: all # 全成才放行；否则 fail-closed
+    proposers:
+      - { provider: minimax, model: MiniMax-M3, profile: synthesize-worker }
+      - { provider: xiaomi, model: mimo-v2.5-pro, profile: synthesize-worker }
+    aggregator: { provider: cliproxy, model: gpt-5.5, profile: synthesize-worker }
+
+  # moa_verify = verify（只读）：★聚合器也必须只读，profile 限 verify-worker /
+  # delivery-readonly-worker（否则聚合器可写、只读被击穿，闭合审核🔴#1）。
+  moa_verify:
+    mode: verify
+    quorum: all
+    proposers:
+      - { provider: minimax, model: MiniMax-M3, profile: verify-worker }
+      - { provider: xiaomi, model: mimo-v2.5-pro, profile: verify-worker }
+    aggregator: { provider: cliproxy, model: gpt-5.5, profile: verify-worker }
+
+# 超时三嵌套（port PaperGo checkTimeoutInvariants，加载期强校验）：
+#   moaTotalBackstopMs ≥ aggregatorPerCallMs 且 ≥ referencePerCallMs；
+#   moaTotalBackstopMs ≥ max(referencePerCallMs) + aggregatorPerCallMs（并行取 max 再串 aggregator）。
+timeouts:
+  referencePerCallMs: 360000 # 每个 proposer 的 per_call
+  aggregatorPerCallMs: 480000 # 聚合器更宽：吃 N 份 proposal + 长输出
+  moaTotalBackstopMs: 900000 # MoA 总硬 backstop，覆盖整条串行链
+
+defaults:
+  preset: default

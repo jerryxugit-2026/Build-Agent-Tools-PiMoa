@@ -1,0 +1,25 @@
+{
+  "name": "pi-moa",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi-MoA dev shell (M0 skeleton: pi SDK + local CLIProxy streaming smoke)",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "m0": "tsx src/m0-smoke.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.81.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "typebox": "^1.1.38",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
