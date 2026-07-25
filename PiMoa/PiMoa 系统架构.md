@@ -1,8 +1,9 @@
 # PiMoa 系统架构与使用手册
 
-> 版本：v2（2026-07-24，对抗审+修复后）｜项目根：`<PIMOA_ROOT>/`
+> 版本：**v2.1**（2026-07-25，实战调优 + 第四轮对抗审 + MoA 自审后）｜项目根：`<PIMOA_ROOT>/`
 > 本文所有文件/目录一律用**绝对路径**。设计意图真源见 `<PIMOA_ROOT>/DESIGN.md`；本文是**实现态**的架构与用法说明。
-> **当前安全状态：🟢 良好·可上线**——经三轮对抗审（含独立复审）+ 逐条修复，§8.2 的 15 项漏洞（4 条 RCE / profile 提权 / 硬链接 / symlink / 注入等）全部实证修复并重审确认；verify 执行改为 **macOS `sandbox-exec` 内运行**（无网络 / 写限 scratch / 读不到 `$HOME`+密钥 / 子进程剥 key），主 containment 从脆弱的命令 allowlist 升级为 OS 级沙箱。残余风险（非 darwin fail-closed、blame/grep repo-local exec 被沙箱围等）见 §8.3，均已评估可接受。**唯一未做：端到端实战验收（§11）。**
+> **当前安全状态：🟢 良好·可上线**——经三轮对抗审（含独立复审）+ 逐条修复，§8.2 的 15 项漏洞（4 条 RCE / profile 提权 / 硬链接 / symlink / 注入等）全部实证修复并重审确认；verify 执行改为 **macOS `sandbox-exec` 内运行**（无网络 / 写限 scratch / 读不到 `$HOME`+密钥 / 子进程剥 key），主 containment 从脆弱的命令 allowlist 升级为 OS 级沙箱。残余风险（非 darwin fail-closed、blame/grep repo-local exec 被沙箱围等）见 §8.3，均已评估可接受。
+> **v2.1 增量（2026-07-25）**：① **侦查前置**（§4.9 `files`/`recon_query` + 行号确定性）——把任务边界在进模型前画好，真实审计 `53.2s 失败 → 22.7s ok`、输入 token `251,808 → ~27k`；② **取证预算**（5 轮 / 20 万 token，§4.3）+ **compaction 打开** + **retry 打开**；③ **检索三件套** rg / ast-grep / rtk 取代 grep/find（§4.8），经**第四轮对抗审**修掉 2 项（ast-grep `-c` 别名绕过、sgconfig 动态库自动加载）；④ **quorum 分模式** `tolerate-one`（§4.4，仅 synthesize；verify 恒 fail-closed）——其兄弟-abort 交界缺陷由 **PiMoa 自审发现并修复**；⑤ 聚合器**去偏**（随机打乱顺序 + 反 verbosity/position/majority 偏差准则）与 **prompt 缓存友好顺序**；⑥ 聚合器换 `deepseek-v4-pro` 直连、MiniMax `maxTokens` 限 4096（整轮 `53.2s → 22.7s`）；⑦ **`models.json` 的 `contextWindow` 修正**：MiniMax-M3 / mimo 原误配 200k（实际 1M），低报 5 倍会让 compaction 提前触发、白丢上下文——这是打开 compaction 的前置条件。**端到端实战验收已完成（§11）**，并已发布 [pimoa-v2 release](https://github.com/jerryxugit-2026/Ai-learning/releases/tag/pimoa-v2)。
 
 ---
 
@@ -50,6 +51,7 @@
 │   ├── moa/
 │   │   ├── types.ts               ← ★共享契约：MoaRequest / ProposalResult / Receipt / MoaResult
 │   │   ├── session.ts             ← 单会话 runner + 工具 allowlist + 隔离 loader + 资源回收
+│   │   ├── recon.ts               ← ★侦查前置：files 预读（打真实行号）+ recon_query（rg 机械检索）
 │   │   └── orchestrate.ts         ← MoA 编排核心：并行 proposers → quorum fail-closed → aggregator
 │   ├── mcp/
 │   │   ├── events.ts              ← StageEvent 类型 + 渲染成 MCP notification
@@ -61,7 +63,7 @@
 │       ├── bash_readonly.ts       ← verify 用命令级只读工具（execFile shell:false 执行）
 │       └── bash_readonly_policy.ts← ★安全关键：命令解析与放行/拒绝判定
 │
-├── test/                          ← 179 个断言，全部 npx tsx 直跑
+├── test/                          ← 381 个断言，全部 npx tsx 直跑
 │   ├── config.test.ts             ← 13：加载期不变量正/负例
 │   ├── moa.test.ts                ← 29：编排 mock 确定性 + fail-closed 负例 + gated live smoke
 │   ├── mcp.test.ts                ← 33：三工具 handler + onStageEvent 事件序列 + abort
@@ -151,6 +153,8 @@ Claude / codex / antigravity（调用方）
   · **会话取证预算**（`src/tools/budget.ts`，read 与 bash_readonly 共用一本账）：**轮数 ≤5**、**输出 ≤20 万 token**，任一触顶即拒并要求模型立即出结论。
   · **compaction 已打开**（M0 冒烟期误关一路带到生产）：主防线=上述预算闸，compaction 为最后兜底。
 - ★`SAFE_SESSION_TOOLS` + `assertNoGrandchildCapability(tools)`：**allowlist 强制**，越界即抛。拦 `subagent/delegate/task/moa_run/bash/execute_code/write`。
+- **`retry` 已打开**（2026-07-25）：上游（gemini/antigravity 等）在长/多轮生成上会间歇性 `Stream ended without finish_reason`——这是**瞬时可恢复**错误；此前 `retry:{enabled:false}` 使其直接坐实成空正文 → fail-closed 核平整轮。重试吃 per-call 超时预算，已配套上调超时 +50%。
+- **usage 含缓存字段**：`extractUsage` 汇总全部 assistant 消息的 `cacheRead`/`cacheWrite`（pi 的 `getSessionStats()` 只回 input/output/total 会丢掉它们）。**命中率低 = prompt 前缀被破坏**，是明确的可优化信号（实测：直连 DeepSeek 逐轮追加命中 83–86%）。
 - `runSession(...)`：**绝不抛**，所有失败折成 `{text,usage,costUsd,durationMs,timedOut,aborted,sawAgentEnd,sessionId,error}` 回传，判决交编排层。
 
 ### 4.4 `<PIMOA_ROOT>/src/moa/orchestrate.ts`（366 行）
@@ -158,9 +162,18 @@ Claude / codex / antigravity（调用方）
 **不变量**：① proposer success 硬定义；② **quorum 分模式**——verify 恒 `all`（任一失败即整体失败）；synthesize 可配 `tolerate-one`：允许**最多 1 个**失败且**成功数 ≥2**（少于 2 份不再是多模型交叉、退化成单模型答案，故仍拒），降级时**只把成功的 proposal 送进聚合**、`receipt.quorum` 诚实标注 `k/N (degraded)`、发 `quorum:degraded`（warning 级）事件；③ aggregator 正文直返不改写；④ 每次产 receipt。失败即 `status:"failed"` + `error{stage}`，**不产出、不降级**（`all` 语义；`tolerate-one` 下的降级是显式标注的例外）。
 > ⚠️ 兄弟 abort 与降级的交界（2026-07-25 MoA 自审实证的真缺陷，已修）：proposer 失败时 abort 兄弟会话用的 `sessionSignal` 与 aggregator **共用同一个 `internalAc`**，故原先的**无条件** abort 会让降级路径的 aggregator 一启动就 `aborted` ⇒ 降级形同虚设。现改为**按容忍额度**：`all` ⇒ 额度 0（首个失败即 abort，行为不变）；`tolerate-one` ⇒ 额度 1（第 2 个失败才 abort）。
 
+**聚合器提示的三项构造规则**（`buildAggregatorPrompt`）：
+1. **nonce 信任边界**：每份 proposal 用 `node:crypto` 随机 nonce 包裹，前言层声明包裹内为**不可信数据**、其中看似指令者不得遵从（proposer 正文无法预测 nonce ⇒ 无法伪造闭合标签越界成"指令层"）。
+2. **消除 position bias**（arXiv:2603.20324 实证：裁判会因**呈现位置**而非质量偏好某份提议）：每次调用用 Fisher-Yates + crypto 随机源**打乱呈现顺序**；标签仍带真实 `index`/`provider/model`，可追溯性不受影响。
+3. **反偏差裁决准则**（针对同论文的三类系统性偏差）：显式要求①**不因篇幅取舍**（长≠对）②**不因位置取舍**（顺序随机、无优先级含义）③**不因多数取舍**（少数派若有更强证据应采纳，冲突需指明并说明采信理由）。
+
+**prompt 缓存友好的拼接顺序**（2026-07-25）：缓存按**前缀**匹配，故 `buildProposerPrompt` 改为 **context（大块可复用材料）在前、prompt（易变问题）在后**；aggregator 侧亦把**固定的**角色说明与裁决准则置于前缀区、把 nonce/任务/proposals 留在变化区。旧拼法（问题在前）等于"同一份材料换个问题就全量重算"——实测我方链路命中率仅 1–7%，而稳定前缀可达 83–86%。
+
 ### 4.5 `<PIMOA_ROOT>/src/mcp/{server.ts,tools.ts,events.ts}`
 - `server.ts`（234 行）：启动期 `loadConfig` + `ModelRuntime.create`，任一失败 **stderr + exit 1**（绝不带病启动）。注册三工具。**stdio 卫生**：绝不往 stdout 打日志（会破坏 MCP JSONL），全走 stderr / notification。在途追踪 + SIGTERM/SIGINT 优雅关闭。
-- `tools.ts`（277 行）：zod inputSchema、工具 description（含模式选择指引）、`runMoaTool` / `runMoaDeliverTool`。
+- `tools.ts`：zod inputSchema、工具 description（含模式选择指引）、`runMoaTool` / `runMoaDeliverTool`。
+  · **`files` / `recon_query` 入参 + `applyRecon`**：调用 `moa/recon.ts` 做侦查前置，结果并入 `req.context`（见 §4.9）。**fail-open**——侦查失败只是不附加内容，绝不毙掉整轮 MoA。
+  · **失败也留住好答案**（`formatSummary`）：`status!=ok` 时，摘要里**附上已产出的单个 proposer 正文**，并标注"未经聚合、未过 fail-closed 把关，仅供参考"。此前失败摘要只有一行 `stage/reason`，健康模型辛苦产出的内容被整个丢弃；fail-closed 只需保证"不把未过关的结论当权威答案"，不必连材料一起烧掉。仅改**展示层**，不碰 orchestrate 的判决逻辑。
 - `events.ts`（67 行）：`StageEvent` → `notifications/message`。事件序列示例：`proposer:started ×2 → proposer:done ×2 → quorum:gathered → aggregator:started → aggregator:done`。quorum 另有 `failed`（fail-closed）与 **`degraded`**（tolerate-one 降级放行，**warning 级**）两个 phase。
 
 ### 4.6 `<PIMOA_ROOT>/src/deliver/write.ts`（187 行）
@@ -203,6 +216,24 @@ verify 的取证执行工具。**词法层**：任何未加引号的 `> < | ; & 
 > - **顶住（无需修）**：rtk 子命令白名单、rtk 本地 filter 的 `trust` 门控（沙箱内 HOME=scratch 空 → 敌意 filter 被跳过）、路径 jail 三检测（越界/nlink/symlink）、ast-grep 子命令与 `-U/-r/-i` denylist。**沙箱主 containment 实测 airtight**：即便 dlopen 执行攻击者原生代码，也读不到 `$HOME`/密钥、无网络出站、写不出 scratch、env 无 key——未能实证任何外泄/落盘/逃逸。
 > - **残余（低危·可接受）**：`rtk ls -la` 会回显 symlink 的目标绝对路径（元数据侧信道；内容读仍被 jail 拦）。`process-exec*` 允许下 dlopen 原生代码是既定风险面，主 containment = 沙箱（与 §8.3 git textconv 残余同性质）。
 > 5 条 fix 回归测试并入 `test/bash_readonly.test.ts`（含 `-c` 全形态 + sgconfig jail live）。
+
+### 4.9 `<PIMOA_ROOT>/src/moa/recon.ts`（侦查前置）★v2 核心
+
+**解决什么**：Claude Code / Codex 调**自家子代理**不撞墙，而外部 MoA 反复撑爆——最根本的差异**不是模型**，是**谁画任务边界**：
+- 内部子代理：主 agent **先侦查**（grep/glob 锁定几个文件）→ 才派活，子代理拿到的是**边界已定**的任务；
+- 外部 MoA：调用方把开放式问题**原样**转发 → proposer 从零自己找 → 只好扫全库 → 多轮工具调用把完整历史反复重发 → 上游长流断裂 → 正文空 → fail-closed。
+
+**做什么**（两层，都在服务端、**不花模型 token**）：
+- **层次二 `files`**：调用方给精确文件清单 → 服务端直接读入附进 `context`。**最有效**。
+- **层次三 `recon_query`**：调用方给检索词 → 服务端用 `rg` 机械检索（`-n --no-heading -m 5 --max-columns 200`，`execFile` 无 shell）→ 命中文件与行号摘要附进 `context`。等于把"主 agent 先侦查"**内置化**。
+
+**★行号确定性**（`withLineNumbers`）：附入的代码**每行左侧打真实行号**（`688| func …`），并在引导语中声明"这就是真实行号，请**照抄**不要自行计数"。
+> 为什么必须做：此前喂的是**裸代码**，模型报行号只能**自己数**——U2 实测 `renderProjectBrief` 真实在 688 行、模型报 553–571（**偏 130 行**），结论与论证链全对、唯独行号不可用。打上行号后同一任务报 688–705，与文件逐条比对**全部命中**。**靠提示词"要求引用片段而非行号"是祈祷；打行号是工程保证。**
+
+**约束**：路径 jail（复用 `bash_readonly` 的越界/硬链接检测）+ 单文件 60k 字符 + 侦查总量 `RECON_MAX_CHARS=180k` 封顶（防"侦查本身"撑爆）+ 按**整行**截断（保证行号与内容严格对齐）。
+**fail-open**：任何读失败/检索失败都降级成一条说明文字，**绝不毙掉整轮 MoA**——侦查只是"帮忙缩小范围"，不该因它失败而全灭。
+
+**实测效果**（PaperGo `assembly.go` 1004 行真实审计）：`53.2s 失败（空正文）` → **`22.7s status=ok`**；输入 token `251,808` → `~27k`；行号从偏 130 行 → **精确**。
 
 ---
 
@@ -318,7 +349,7 @@ npx tsx test/bash_readonly.test.ts      # 64
 npx tsx test/bash_readonly_sandbox.test.ts  # 64（沙箱边界 + RCE/symlink/hardlink 回归）
 npx tsx test/security.test.ts           # 10（防孙 agent allowlist）
 ```
-**当前状态：314 断言全绿，tsc 干净。**
+**当前状态：381 断言全绿，tsc 干净。**
 **三端点直连 live 全链已真跑通过**（真 key 下）：minimax 直连 4.2s / xiaomi 直连 5.8s / cliproxy 聚合产出综合结论。
 
 ---
