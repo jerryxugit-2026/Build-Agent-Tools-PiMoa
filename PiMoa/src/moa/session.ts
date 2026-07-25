@@ -267,6 +267,22 @@ export async function runSession(
     const created = await createAgentSession({
       cwd,
       model,
+      // ★推理保持关闭（2026-07-25 实测定标，3 任务 × 4 配置 = 12 次调用）。**别想当然去打开它。**
+      //   数据：开/关的**质量要素命中数完全相同**（3/4 vs 3/4、4/4 vs 4/4）；唯一差异是任务①的
+      //   gemini 开 high 后反而从 3/4 掉到 2/4（丢了"无条件 abort 是根因"这条最关键的观察）。
+      //   而延迟代价极不稳定：DeepSeek 开推理在架构权衡任务上 30.9s → **109.0s（3.5 倍）**，
+      //   烧 5,549 推理 token 换来同样的 4/4。proposer 并行取 max ⇒ 一个慢的就拖垮整轮。
+      //   **原理**：推理的价值在于"填补信息空白"，而侦查前置（§4.9 files/recon_query，带行号）
+      //   已把材料喂满——答案在材料里，需要的是"看仔细"而非"想很久"，思考链无用武之地，
+      //   反而会①与正文竞争输出预算（实测 DeepSeek flash 推理吃光 → 空正文）②长链发散丢掉直接观察。
+      //   注：本设置对 proposer 其实**无效**——它们在 models.json 标 `reasoning:false`，
+      //   pi 的 models.ts:664 `if (!model.reasoning) return ["off"]` 已把可选档锁死为 off，
+      //   模型跑自己的默认档（实测该默认档质量最好）。此处真正生效的是**聚合器** deepseek
+      //   （标 reasoning:true）：pi 会据此发 `thinking:{type:"disabled"}`，即主动关闭其推理。
+      //   ⚠️ 另一个坑：显式传 `reasoning_effort:"high"` 未必更"高"——各服务商映射不一，实测
+      //   gemini 传 high 后 reasoning_token 反而变 0（被映射成关闭）。**不传比传安全。**
+      //   ⚠️ 本结论只对 **code review 类任务**（答案在材料内）成立；论文审核那类需要重建论证链条、
+      //   做反事实判断的任务，推理的边际收益可能相反——换场景需重新实测，勿直接套用。
       thinkingLevel: "off",
       modelRuntime,
       tools,
