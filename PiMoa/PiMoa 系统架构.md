@@ -116,11 +116,13 @@ Claude / codex / antigravity（调用方）
         │  · ★assertNoGrandchildCapability：工具必须 ⊆ SAFE_SESSION_TOOLS
         │  · finally：dispose + clearTimeout + removeEventListener + unsubscribe
         ▼
-   三个模型端点（分散，避免单点依赖）
-   ├── proposer  MiniMax-M3     → https://api.minimaxi.com/anthropic        （Anthropic 协议，直连）
-   ├── proposer  mimo-v2.5-pro  → https://token-plan-sgp.xiaomimimo.com/v1  （OpenAI 协议，直连）
-   └── aggregator deepseek-v4-pro → https://api.deepseek.com                （直连，1M 上下文）
-   （历史：proposer 2 曾用 xiaomi/mimo-v2.5-pro，现为 minimax/MiniMax-M3；`xiaomi` provider 仍在 `providers:` 段保留 endpoint，但当前**未被任何 preset 引用**）
+   三个模型端点（当前 default / moa_verify 两 preset 同构；实测延迟见 §5.4）
+   ├── proposer  gemini-3.6-flash-high → http://127.0.0.1:8317/v1           （本地 CLIProxy，maxTokens 16384，实测 ~8.7s）
+   ├── proposer  MiniMax-M3            → https://api.minimaxi.com/anthropic （Anthropic 协议直连，**maxTokens 限 4096**，实测 ~12.4s）
+   └── aggregator deepseek-v4-pro      → https://api.deepseek.com           （OpenAI 协议直连，1M 上下文，maxTokens 65536，实测 ~10.3s）
+   （proposer 并行取 max ⇒ 整轮 ≈ max(8.7, 12.4) + 10.3 ≈ 22.7s。
+    历史：proposer 曾为 minimax/MiniMax-M3 + xiaomi/mimo-v2.5-pro，聚合器曾为 cliproxy/gpt-5.5；
+    `xiaomi` provider 仍在 `providers:` 段保留 endpoint，但当前**未被任何 preset 引用**）
 
 （moa_deliver 额外一步）→ <PIMOA_ROOT>/src/deliver/write.ts
         · 系统（非 LLM）原子写：同目录 tmp(wx) → fsync → rename
@@ -247,8 +249,27 @@ verify 的取证执行工具。**词法层**：任何未加引号的 `> < | ; & 
 pi `ModelRuntime` 的模型注册表——**这是运行期真正生效的 endpoint 与 key 引用**：
 - `cliproxy` → `http://127.0.0.1:8317/v1`，`api: openai-completions`，`apiKey: "$CLIPROXY_API_KEY"`，模型 `gpt-5.5` / `gemini-3.6-flash-high`
 - `deepseek` → `https://api.deepseek.com`，`api: openai-completions`，`apiKey: "$DEEPSEEK_API_KEY"`，模型 `deepseek-v4-pro`（**当前聚合器**，1M 上下文 / maxTokens 65536——推理模型需足够输出预算，否则推理吃光→空正文）
-- `minimax` → `https://api.minimaxi.com/anthropic`，`api: anthropic-messages`，`apiKey: "$MINIMAX_API_KEY"`，模型 `MiniMax-M3`
+- `minimax` → `https://api.minimaxi.com/anthropic`，`api: anthropic-messages`，`apiKey: "$MINIMAX_API_KEY"`，模型 `MiniMax-M3`（**当前 proposer 2**，1M 上下文 / **maxTokens 限 4096**）
+  > ★为什么限 4096（2026-07-25 实测定标）：MiniMax-M3 话极多——同一任务下 `maxTokens=16384` 时吐 **10,902 字符 / 28.1s**，而其它模型只有 350–540 字符。**proposer 并行取 max ⇒ 它一个人决定整轮速度**（对照 Hermes 文档「墙钟时间与 advisor 输出 token 数强相关」）。实测三档：16384→10,902 字符/28.1s、**4096→4,305 字符/21.3s**、2048→3,069 字符/15.4s，**三档均 `finish=stop` 不空正文**（它推理占比不高，压预算安全）。取 4096：既压掉延迟，产出的提议反而更聚焦。**结论：话痨模型不必换掉，套 `maxTokens` 即可。**
 - `xiaomi` → `https://token-plan-sgp.xiaomimimo.com/v1`，`api: openai-completions`，`apiKey: "$XIAOMI_API_KEY"`，模型 `mimo-v2.5-pro`
+
+### 5.4 模型选型的实测基线（2026-07-25）
+
+同一中等负载任务（~8k token 代码 + 简明评审要求），各候选实测延迟与产出：
+
+| 模型 | 接入 | 延迟 | 正文 | 备注 |
+|---|---|---|---|---|
+| `deepseek-v4-flash` | 直连 | **5.5s** | 350 | 最快 |
+| **`deepseek-v4-pro`** | 直连 | **9.5s** | 416 | **当前聚合器** |
+| `gemini-3.5-flash-extra-low` | CLIProxy | 11.9s | 308 | |
+| **`gemini-3.6-flash-high`** | CLIProxy | **12.0s** | 542 | **当前 proposer 1**（正文最长＝质量信号） |
+| `mimo-v2.5-pro` | 直连 | 12.5s | 460 | 现未被 preset 引用 |
+| `gemini-3-flash` | CLIProxy | 12.6s | 367 | |
+| `gemini-3.5-flash-low` | CLIProxy | 22.5s | 355 | ⚠️ **名字骗人**：比 `extra-low` / `-high` 都慢一倍，勿用 |
+| **`MiniMax-M3`** | 直连 | **36.4s** | **6,946** | 话痨 ⇒ 已限 `maxTokens=4096`，降至 ~12.4s（见 §5.2） |
+
+**选型逻辑**：proposer 并行取 max，故**整轮速度由最慢的 proposer 决定**；聚合器串在其后。当前组合整轮 ≈ 22.7s（曾 53.2s）。
+**质量优先于多样性**（[Rethinking MoA](https://arxiv.org/abs/2502.00674)，ICLR 2025：质量系数 α ≫ 多样性系数 β）——故不盲目堆 proposer 数量，保持 2 个「少而强」。
 
 ### 5.3 密钥（三个环境变量）
 
