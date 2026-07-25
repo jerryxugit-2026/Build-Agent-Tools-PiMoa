@@ -23,8 +23,12 @@ export type StageEvent =
     }
   | {
       stage: "quorum";
-      /** gathered=全部 proposer 成功放行；failed=fail-closed 整体失败。 */
-      phase: "gathered" | "failed";
+      /**
+       * gathered=达标放行；failed=fail-closed 整体失败；
+       * degraded=`quorum:"tolerate-one"`（仅 synthesize）下少一份提议但仍放行——**告警级**，
+       * 调用方应知悉本次综合只有 N-1 份提议参与（receipt.quorum 亦标 `(degraded)`）。
+       */
+      phase: "gathered" | "failed" | "degraded";
       ok: number;
       total: number;
     }
@@ -51,11 +55,14 @@ export function stageEventToNotification(e: StageEvent): {
       break;
     }
     case "quorum": {
-      if (e.phase === "failed") level = "warning";
+      // degraded 与 failed 同为 warning：调用方必须注意到「本次只有 N-1 份提议参与综合」。
+      if (e.phase === "failed" || e.phase === "degraded") level = "warning";
       data =
         e.phase === "gathered"
           ? `[moa] quorum gathered ${e.ok}/${e.total}`
-          : `[moa] fail-closed: quorum ${e.ok}/${e.total} → 整体失败`;
+          : e.phase === "degraded"
+            ? `[moa] quorum degraded ${e.ok}/${e.total} → 降级放行（tolerate-one，仅 synthesize）：本次综合少一份提议`
+            : `[moa] fail-closed: quorum ${e.ok}/${e.total} → 整体失败`;
       break;
     }
     case "aggregator": {

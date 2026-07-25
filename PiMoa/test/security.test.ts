@@ -26,7 +26,11 @@ console.log("[security-test] allowlist =", [...SAFE_SESSION_TOOLS]);
 
 // 放行：allowlist 内的只读工具
 ok(!throws([]), "空工具集放行");
-ok(!throws(["read", "grep", "find", "ls"]), "只读四件套放行");
+ok(!throws(["read", "ls", "bash_readonly"]), "现行只读工具集放行（read/ls/bash_readonly）");
+// ★grep/find 已全面下线（检索改走 rg / ast-grep / rtk，见架构 §4.8）：SAFE_SESSION_TOOLS 同步不再放行，
+//   防止日后误把它们加回某 profile 时本闸失灵（2026-07-25 MoA 自审发现的纵深防御缺口）。
+ok(throws(["read", "grep"]), "已下线的 grep 被 allowlist 拒");
+ok(throws(["read", "find"]), "已下线的 find 被 allowlist 拒");
 
 // 拦截：任何越界工具（防孙 agent / 提权 / 递归扇出）
 ok(throws(["subagent"]), "subagent 拦截");

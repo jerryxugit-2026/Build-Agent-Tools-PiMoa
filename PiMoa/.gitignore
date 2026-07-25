@@ -1,8 +1,5 @@
 node_modules/
 config/auth.json
 config/agent-empty/
-config/models-store.json
-refs/
 *.log
-*.bak-*
 .DS_Store

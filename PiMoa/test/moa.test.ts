@@ -547,3 +547,123 @@ main().catch((err) => {
   console.error("[moa-test] 未捕获错误:", err);
   process.exitCode = 1;
 });
+
+// ── quorum 分模式（2026-07-25）：verify 恒 fail-closed；synthesize 可 tolerate-one 降级 ──
+{
+  log("=== 用例 20：quorum=tolerate-one（synthesize）少一份仍放行且诚实标注 ===");
+  const cfg = makeConfig();
+  (cfg.presets as any).degradable = {
+    mode: "synthesize",
+    quorum: "tolerate-one",
+    proposers: [
+      { provider: "minimax", model: "MiniMax-M3", profile: "synthesize-worker" },
+      { provider: "xiaomi", model: "mimo-v2.5-pro", profile: "synthesize-worker" },
+      { provider: "cliproxy", model: "gpt-5.5", profile: "synthesize-worker" },
+    ],
+    aggregator: { provider: "cliproxy", model: "gpt-5.5", profile: "synthesize-worker" },
+  };
+  // 3 个 proposer 挂 1 个 → 2 份成功 ⇒ 满足 ≥2 且 ≥N-1 ⇒ 降级放行
+  const mock = makeMockRunSession({
+    "minimax/MiniMax-M3": mkResult({ text: "提议A", sawAgentEnd: true }),
+    "xiaomi/mimo-v2.5-pro": mkResult({ error: "boom", sawAgentEnd: false }),
+    "cliproxy/gpt-5.5": mkResult({ text: "提议C/合成文", sawAgentEnd: true }),
+  });
+  const r = await runMoa(cfg, { prompt: "x", preset: "degradable" }, { modelRuntime: null, runSessionImpl: mock });
+  log(`status=${r.status} quorum=${r.receipt.quorum} aggregated.len=${r.aggregated.length}`);
+  assert(r.status === "ok", "tolerate-one：少一份仍 status=ok（不再整轮全灭）");
+  assert(r.aggregated.trim().length > 0, "降级后仍产出聚合正文");
+  assert(/\(degraded\)/.test(r.receipt.quorum), "receipt.quorum 诚实标注 (degraded)，不谎报 N/N");
+  assert(/^2\/3/.test(r.receipt.quorum), "receipt 记录实际参与数 2/3");
+}
+{
+  log("=== 用例 21：tolerate-one 但成功数 <2 → 仍 fail-closed（不退化成单模型）===");
+  const cfg = makeConfig();
+  (cfg.presets as any).degradable2 = {
+    mode: "synthesize",
+    quorum: "tolerate-one",
+    proposers: [
+      { provider: "minimax", model: "MiniMax-M3", profile: "synthesize-worker" },
+      { provider: "xiaomi", model: "mimo-v2.5-pro", profile: "synthesize-worker" },
+    ],
+    aggregator: { provider: "cliproxy", model: "gpt-5.5", profile: "synthesize-worker" },
+  };
+  const mock = makeMockRunSession({
+    "minimax/MiniMax-M3": mkResult({ text: "只剩我一个", sawAgentEnd: true }),
+    "xiaomi/mimo-v2.5-pro": mkResult({ error: "boom", sawAgentEnd: false }),
+  });
+  const r = await runMoa(cfg, { prompt: "x", preset: "degradable2" }, { modelRuntime: null, runSessionImpl: mock });
+  log(`status=${r.status} error=${JSON.stringify(r.error)}`);
+  assert(r.status === "failed", "2 proposer 挂 1 → 只剩 1 份 <2 ⇒ 仍 fail-closed");
+  assert(r.aggregated === "", "未产出（1 份不叫多模型交叉）");
+}
+{
+  log("=== 用例 22：★verify 模式绝不降级（安全不变量）===");
+  const cfg = makeConfig();
+  (cfg.presets as any).verify_degrade = {
+    mode: "verify",
+    quorum: "tolerate-one", // 即便配置被改成 tolerate-one（加载期已拒，此处防运行期绕过）
+    proposers: [
+      { provider: "minimax", model: "MiniMax-M3", profile: "verify-worker" },
+      { provider: "xiaomi", model: "mimo-v2.5-pro", profile: "verify-worker" },
+      { provider: "cliproxy", model: "gpt-5.5", profile: "verify-worker" },
+    ],
+    aggregator: { provider: "cliproxy", model: "gpt-5.5", profile: "verify-worker" },
+  };
+  const mock = makeMockRunSession({
+    "minimax/MiniMax-M3": mkResult({ text: "证据A", sawAgentEnd: true }),
+    "xiaomi/mimo-v2.5-pro": mkResult({ error: "boom", sawAgentEnd: false }),
+    "cliproxy/gpt-5.5": mkResult({ text: "证据C", sawAgentEnd: true }),
+  });
+  const r = await runMoa(cfg, { prompt: "x", preset: "verify_degrade" }, { modelRuntime: null, runSessionImpl: mock });
+  log(`status=${r.status}`);
+  assert(r.status === "failed", "verify 即便 quorum=tolerate-one 也**恒 fail-closed**（少一个验证者=交叉核验前提不成立）");
+  assert(r.aggregated === "", "verify 降级不产出");
+}
+
+// ── 用例 23：★真实 signal 语义下的降级（补测试盲区）──
+// 背景：用例 20 的 mock **不检查 signal**，因而漏掉了一个真缺陷——兄弟 abort 无条件触发时，
+// aggregator 用的同一个 sessionSignal 已 aborted ⇒ 降级路径必然返回 stage:"abort"（形同虚设）。
+// 本用例的 mock **像真 runSession 一样尊重 signal**，锁死修复不回归。
+{
+  log("=== 用例 23：降级路径在「mock 尊重 signal」下仍能跑完 aggregator ===");
+  const cfg = makeConfig();
+  (cfg.presets as any).deg3 = {
+    mode: "synthesize",
+    quorum: "tolerate-one",
+    proposers: [
+      { provider: "minimax", model: "MiniMax-M3", profile: "synthesize-worker" },
+      { provider: "xiaomi", model: "mimo-v2.5-pro", profile: "synthesize-worker" },
+      { provider: "cliproxy", model: "gpt-5.5", profile: "synthesize-worker" },
+    ],
+    aggregator: { provider: "cliproxy", model: "gemini-3.6-flash-high", profile: "synthesize-worker" },
+  };
+  const signalAwareMock: any = async (_mr: any, w: any, _p: string, opts: any) => {
+    const base = { usage: null, costUsd: 0, durationMs: 1, timedOut: false, aborted: false, sawAgentEnd: true };
+    if (opts?.signal?.aborted) return { ...base, text: "", sawAgentEnd: false, aborted: true };
+    if (w.model === "gpt-5.5") return { ...base, text: "", sawAgentEnd: false, error: "boom" };
+    if (w.model === "gemini-3.6-flash-high") return { ...base, text: "聚合结论" };
+    return { ...base, text: `提议-${w.model}` };
+  };
+  const r = await runMoa(cfg, { prompt: "x", preset: "deg3" }, { modelRuntime: null, runSessionImpl: signalAwareMock });
+  log(`status=${r.status} error=${JSON.stringify(r.error)} quorum=${r.receipt.quorum}`);
+  assert(r.status === "ok", "★降级路径下 aggregator 不被兄弟 abort 误杀（signal-aware mock）");
+  assert(r.aggregated.includes("聚合结论"), "降级后 aggregator 真的跑完并产出正文");
+  assert(/2\/3 \(degraded\)/.test(r.receipt.quorum), "receipt 标注 2/3 (degraded)");
+}
+{
+  log("=== 用例 24：quorum=all 下兄弟 abort 行为不变（首个失败即 abort）===");
+  const cfg = makeConfig(); // default preset = quorum:"all"
+  let aborted = 0;
+  const signalAwareMock: any = async (_mr: any, w: any, _p: string, opts: any) => {
+    const base = { usage: null, costUsd: 0, durationMs: 1, timedOut: false, aborted: false, sawAgentEnd: true };
+    if (opts?.signal?.aborted) { aborted++; return { ...base, text: "", sawAgentEnd: false, aborted: true }; }
+    if (w.model === "MiniMax-M3") return { ...base, text: "", sawAgentEnd: false, error: "boom" };
+    await new Promise((res) => setTimeout(res, 20)); // 让兄弟有机会收到 abort
+    if (opts?.signal?.aborted) { aborted++; return { ...base, text: "", sawAgentEnd: false, aborted: true }; }
+    return { ...base, text: "提议" };
+  };
+  const r = await runMoa(cfg, { prompt: "x" }, { modelRuntime: null, runSessionImpl: signalAwareMock });
+  log(`status=${r.status} 兄弟被abort次数=${aborted}`);
+  assert(r.status === "failed", "quorum=all：任一失败仍整体 failed（行为未因修复而改变）");
+  assert(aborted >= 1, "quorum=all：首个失败即 abort 兄弟（省 token 的初衷保留）");
+}

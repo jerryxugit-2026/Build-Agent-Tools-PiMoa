@@ -11,6 +11,7 @@ import { z } from "zod";
 import type { Mode, MoaConfig, ProfileName, WorkerRef } from "../config/types.js";
 import type { MoaRequest, MoaResult } from "../moa/types.js";
 import { runMoa, type RunSessionImpl } from "../moa/orchestrate.js";
+import { runRecon } from "../moa/recon.js";
 import { atomicWriteWithVerify, DONE_MARKER_RE } from "../deliver/write.js";
 import type { StageEvent } from "./events.js";
 
@@ -35,6 +36,21 @@ export const moaToolInput = {
     .string()
     .optional()
     .describe("可选补充上下文（贴代码/文件片段/背景），与 prompt 拼接后下发"),
+  files: z
+    .array(z.string().min(1))
+    .optional()
+    .describe(
+      "★强烈推荐：要 MoA 审阅的**精确文件清单**（相对 cwd 或绝对路径，须在 cwd 内）。" +
+        "服务端会直接读入并附进上下文，proposer 因此**不必自己扫库找文件**——这是避免" +
+        "「开放式任务→模型扫全库→上下文撑爆→整轮失败」的最有效手段。先自己定位好文件再调用。",
+    ),
+  recon_query: z
+    .string()
+    .optional()
+    .describe(
+      "可选：机械检索词。服务端会先用 rg 在 cwd 内检索（**不经模型**），把命中文件与行号摘要" +
+        "附进上下文，等于替 proposer 做完「先侦查再干活」这一步。不确定该给哪些 files 时用它。",
+    ),
   preset: z
     .string()
     .optional()
@@ -64,6 +80,10 @@ export interface WorkerOverride {
 export interface MoaToolInput {
   prompt: string;
   context?: string;
+  /** 精确文件清单：服务端读入后附进 context（层次二：把任务边界画好，proposer 不必自己找）。 */
+  files?: string[];
+  /** 机械检索词：服务端用 rg 预检索后附进 context（层次三：把"先侦查"内置化）。 */
+  recon_query?: string;
   preset?: string;
   models?: WorkerOverride[];
   aggregator?: WorkerOverride;
@@ -119,6 +139,31 @@ export function buildRequest(input: MoaToolInput, defaultPreset: string): MoaReq
   };
 }
 
+/**
+ * ★侦查前置（层次二 files + 层次三 recon_query，见 src/moa/recon.ts）。
+ * 在**进模型之前**由服务端机械读取/检索，把结果并入 req.context —— 任务边界画好，
+ * proposer 不必自己扫库（这正是内部子代理不撑爆、外部 MoA 撑爆的根本差异）。
+ * 绝不抛：侦查失败降级为不附加内容，不影响主流程。
+ */
+export async function applyRecon(req: MoaRequest, input: MoaToolInput): Promise<MoaRequest> {
+  const hasFiles = Array.isArray(input.files) && input.files.length > 0;
+  const hasQuery = typeof input.recon_query === "string" && input.recon_query.trim() !== "";
+  if (!hasFiles && !hasQuery) return req;
+  try {
+    const r = await runRecon({
+      ...(input.files ? { files: input.files } : {}),
+      ...(input.recon_query ? { reconQuery: input.recon_query } : {}),
+      cwd: req.cwd ?? process.cwd(),
+    });
+    if (!r.text && r.notes.length === 0) return req;
+    const noteBlock = r.notes.length > 0 ? `\n[侦查说明] ${r.notes.join("；")}` : "";
+    const merged = [req.context, r.text + noteBlock].filter((s) => s && s.trim() !== "").join("\n\n");
+    return { ...req, context: merged };
+  } catch {
+    return req; // fail-open：侦查不该毙掉整轮 MoA
+  }
+}
+
 /** MoaResult → 人读文本摘要（LLM 主要读 content[].text）。 */
 export function formatSummary(r: MoaResult): string {
   const rc = r.receipt;
@@ -142,6 +187,28 @@ export function formatSummary(r: MoaResult): string {
       .map(([k, v]) => `${k}=${v}`)
       .join(", ");
     if (marks) lines.push(`proposerMarks: ${marks}`);
+    // 失败时也把已产出的 proposer 正文透出（“留住好答案”，徐总 2026-07-25）：fail-closed 只保证
+    //   「不把未过关的结论当权威答案给你」，但某个 proposer 已经产出的正文不该白扔（否则健康模型
+    //   的答案在失败摘要里彻底看不到）。仅改此展示层，不碰 orchestrate 的判决/兄弟 abort 逻辑。
+    const salvaged = r.proposals.filter((p) => p.text.trim().length > 0);
+    if (salvaged.length > 0) {
+      lines.push("");
+      lines.push(
+        `[以下为 ${salvaged.length} 份已产出的单个 proposer 正文 —— 未经聚合、未过 fail-closed 把关，` +
+          "仅供参考/自行取用，勿当作本工具的权威结论]",
+      );
+      for (const p of salvaged) {
+        const mark = p.ok
+          ? "completed"
+          : p.timeout
+            ? "timeout"
+            : p.error
+              ? "error"
+              : "aborted/partial";
+        lines.push(`\n----- proposer ${p.model} (${mark}) -----`);
+        lines.push(p.text.trim());
+      }
+    }
   }
   return lines.join("\n");
 }
@@ -280,7 +347,7 @@ export async function runMoaTool(
   defaultPreset: string,
   deps: MoaToolDeps,
 ): Promise<ToolResponse> {
-  const req = buildRequest(input, defaultPreset);
+  const req = await applyRecon(buildRequest(input, defaultPreset), input);
   // 越界拒绝：preset.mode 必须与本工具默认 preset 的 mode 一致（fix #4）。
   const boundaryErr = enforcePresetModeMatchesTool(deps.config, req, defaultPreset);
   if (boundaryErr) return toToolResponse(boundaryErr);
@@ -348,7 +415,7 @@ export async function runMoaDeliverTool(
 ): Promise<ToolResponse> {
   // 1) 跑 MoA。forceProfile 把全部 worker 钉死为 delivery-readonly-worker（无论 preset）。
   //    覆盖入参 models/aggregator 只贡献 provider/model，profile 由 orchestrate 强制。
-  const req = buildRequest(input, defaultPreset);
+  const req = await applyRecon(buildRequest(input, defaultPreset), input);
   const r = await runMoa(deps.config, req, {
     modelRuntime: deps.modelRuntime,
     forceProfile: "delivery-readonly-worker",

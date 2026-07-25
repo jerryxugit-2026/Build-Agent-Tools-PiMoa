@@ -19,6 +19,14 @@ export interface Usage {
 	input: number;
 	output: number;
 	reasoning?: number;
+	/**
+	 * 命中 prompt 缓存的输入 token（`input` 的子集）。多轮工具调用每轮重发完整历史，
+	 * 但前缀相同 ⇒ 绝大部分应命中缓存（DeepSeek 直连实测：第 2/3 轮命中 83%/86%）。
+	 * **命中率低 = 前缀被破坏**（注入了时间戳/随机内容/顺序抖动），是明确的可优化信号。
+	 */
+	cacheRead?: number;
+	/** 写入 prompt 缓存的 token（首轮建缓存的开销）。 */
+	cacheWrite?: number;
 	totalTokens: number;
 }
 

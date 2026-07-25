@@ -17,12 +17,29 @@
  * execute 只 execFile 只读命令（无 spawn agent CLI、无写、无 MCP）。详见汇报。
  */
 import { execFile } from "node:child_process";
-import { realpathSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { resolve, sep } from "node:path";
 import { defineTool, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { analyzeCommand } from "./bash_readonly_policy.js";
 import { buildSandboxedInvocation, expandTildeForCheck } from "./sandbox.js";
+import {
+  budgetCrossedNotice,
+  budgetExhaustedReason,
+  chargeBudget,
+  createRetrievalBudget,
+  isBudgetExhausted,
+  SESSION_OUTPUT_CHAR_BUDGET,
+  type RetrievalBudget,
+} from "./budget.js";
+
+// 预算相关符号从 ./budget.js 统一导出（测试与 read 工具共用同一本账）。
+export {
+  createRetrievalBudget,
+  SESSION_OUTPUT_CHAR_BUDGET,
+  SESSION_TOKEN_BUDGET,
+  type RetrievalBudget,
+} from "./budget.js";
 
 /** 单次执行硬上限：防大输出 / 挂起。 */
 const EXEC_TIMEOUT_MS = 15_000;
@@ -108,7 +125,7 @@ function runArgv(
  * flag（`-` 前缀）与解析后落在 root 内/不存在的参数不因此拒（交给命令自身处理），避免误拒取证用法。
  * 返回 null=通过；否则返回拒绝原因。
  */
-function checkPathJail(argv: string[], cwd: string): string | null {
+export function checkPathJail(argv: string[], cwd: string): string | null {
   let root: string;
   try {
     root = realpathSync(cwd);
@@ -162,9 +179,40 @@ function checkPathJail(argv: string[], cwd: string): string | null {
   return null;
 }
 
+/**
+ * ★对抗审 #8：ast-grep 会**自动发现**审计根/祖先里的 `sgconfig.yml`，其 `customLanguages.libraryPath`
+ * 指向的 `.dylib` 会在 dlopen 时执行构造函数（攻击者原生代码）——且命令行从不引用该 dylib/配置，
+ * 故 checkPathJail（只审 argv token）看不到它。ast-grep 只向**上**（cwd→祖先）发现配置，沙箱内祖先
+ * 不可读，故实际可加载的只有审计根（=cwd）下的 `sgconfig.{yml,yaml}`。此处执行前扫描该文件，含
+ * `customLanguages`/`libraryPath` 即拒（策略层补上沙箱之外的第二道；沙箱仍是主 containment）。
+ * 返回 null=通过；否则返回拒绝原因。
+ */
+function astGrepConfigJail(cwd: string): string | null {
+  for (const name of ["sgconfig.yml", "sgconfig.yaml"]) {
+    const p = resolve(cwd, name);
+    let content: string;
+    try {
+      if (!statSync(p).isFile()) continue;
+      content = readFileSync(p, "utf8");
+    } catch {
+      continue; // 不存在/不可读：ast-grep 也加载不到 → 无需拒
+    }
+    if (/customLanguages|libraryPath/i.test(content)) {
+      return `审计根存在 ${name} 且含 customLanguages/libraryPath —— ast-grep 会自动加载并经动态库执行代码（对抗审 #8）。移除该配置或改用 rg。`;
+    }
+  }
+  return null;
+}
+
 function clip(s: string): string {
   if (s.length <= MAX_OUTPUT_CHARS) return s;
-  return s.slice(0, MAX_OUTPUT_CHARS) + `\n…[截断，共 ${s.length} 字符]`;
+  // ★到上限即掐断，并给调用方明确、可执行的反馈（徐总 2026-07-25）：不能让模型误以为“看全了”。
+  //   告知：已被截断、只显示前 N / 共 M、后续未返回、以及如何缩小范围重查。
+  return (
+    s.slice(0, MAX_OUTPUT_CHARS) +
+    `\n\n⚠️ [bash_readonly：输出达到上限 ${MAX_OUTPUT_CHARS} 字符已截断——仅返回前 ${MAX_OUTPUT_CHARS} / 共 ${s.length} 字符，` +
+    "其余未返回。请勿据此判断“已看全”；用更精确的路径、更具体的 grep pattern、或缩小 find 范围后重新查询。]"
+  );
 }
 
 /**
@@ -193,6 +241,17 @@ export async function runBashReadonly(
       text: `REJECTED（路径 jail）：${jailReason}\n命令：${command}`,
     };
   }
+  // ast-grep 专属：审计根 sgconfig 动态库加载 jail（对抗审 #8，命令行不引用配置故 checkPathJail 覆盖不到）。
+  if (verdict.argv[0] === "ast-grep") {
+    const cfgReason = astGrepConfigJail(cwd);
+    if (cfgReason) {
+      return {
+        rejected: true,
+        reason: cfgReason,
+        text: `REJECTED（ast-grep 配置 jail）：${cfgReason}\n命令：${command}`,
+      };
+    }
+  }
   const r = await runArgv(verdict.argv, cwd, signal);
   if (r.spawnError) {
     return { rejected: false, text: `执行错误：${r.spawnError}` };
@@ -206,20 +265,29 @@ export async function runBashReadonly(
 }
 
 /**
- * pi 自定义工具定义。经 `createAgentSession({ customTools:[bashReadonlyTool] })` 注入，
- * 并需在会话 `tools` 数组里列出 "bash_readonly" 才启用（见 session.ts 两处 allowlist）。
+ * pi 自定义工具**工厂**：每个会话建一份独立实例，绑定自己的预算账本
+ * （模块级单例会让并行 proposer 互扣额度，故必须逐会话建）。
+ * 预算与 `read` 工具**共用同一本账**（见 src/tools/budget.ts）。
+ * 不传 budget ⇒ 建一个新的（等价于该实例独占预算）。
  */
-export const bashReadonlyTool = defineTool({
+export function createBashReadonlyTool(budget: RetrievalBudget = createRetrievalBudget()) {
+  return defineTool({
   name: "bash_readonly",
   label: "Bash (read-only)",
   description:
     "在**OS 级沙箱内**运行一条**只读取证** bash 命令并返回 stdout（沙箱：无网络、写限临时目录、" +
-    "读限审计目标、env 无密钥）。仅放行固定 allowlist：git diff/status/log/show 等只读子命令、" +
-    "sha256sum/md5/shasum 等哈希、stat/file/wc/readlink/realpath/du/df、只读 find（禁 -exec/-delete）、" +
-    "ls/cat/head/tail/grep/rg/pwd/echo。任何写重定向(>/>>)、管道写、bash -c/eval/sudo/xargs、" +
-    "命令替换 $()/``、;/&&/|| 串接、越出审计根的路径、不可解析命令都会被拒。禁止用它修改被审对象。",
+    "读限审计目标、env 无密钥；输出封顶 6 万字符，超了会明确提示截断）。\n" +
+    "★检索三件套（各司其职，别混用）：\n" +
+    "  · 找文本/正则/找文件 → `rg`（如 `rg -n 模式 路径`、`rg --files -g '*.ts'`）；\n" +
+    "  · 找代码结构（某种函数/调用/写法，忽略注释与字符串）→ `ast-grep run -p '模式' -l ts 路径`" +
+    "（★模式必须用**单引号**包裹，内含 $ 才不被拒）；\n" +
+    "  · 紧凑地读文件/列目录（省 token）→ `rtk read 文件`、`rtk ls .`。\n" +
+    "其余放行：git diff/status/log/show 等只读子命令、sha256sum/md5/shasum 哈希、stat/file/wc/readlink/" +
+    "realpath/du/df、cat/head/tail/pwd/echo。**grep 与 find 已下线**（分别用 rg / ast-grep）。" +
+    "写重定向(>/>>)、管道写、bash -c/eval/sudo/xargs、命令替换 $()/``、;/&&/|| 串接、越界路径、" +
+    "rtk 的执行类子命令（docker/test/err…）、ast-grep 的写/rewrite 全拒。禁止用它修改被审对象。",
   promptSnippet:
-    "bash_readonly: 沙箱内只读取证 bash（git diff/hash/stat/只读 find 等；无网络/写限 scratch/路径 jail；写/重定向/串接一律拒）",
+    "bash_readonly: 沙箱内只读取证（搜文本用 rg / 搜结构用 ast-grep / 紧凑读用 rtk read / git diff/hash/stat；无网络·写限 scratch·路径 jail；grep/find 已下线，写/执行/串接一律拒）",
   parameters: Type.Object({
     command: Type.String({
       description:
@@ -233,17 +301,50 @@ export const bashReadonlyTool = defineTool({
     _onUpdate: unknown,
     ctx: ExtensionContext,
   ) => {
+    // ★会话级预算闸：已超顶即拒绝再检索（在执行**之前**判，省掉无谓的沙箱开销）。
+    if (isBudgetExhausted(budget)) {
+      const reason = budgetExhaustedReason(budget);
+      return {
+        content: [{ type: "text" as const, text: `REJECTED（取证预算耗尽）：${reason}` }],
+        details: {
+          command: params.command,
+          rejected: true,
+          reason,
+          budgetUsedChars: budget.usedChars,
+          budgetLimitChars: SESSION_OUTPUT_CHAR_BUDGET,
+        },
+        isError: true,
+      };
+    }
+
     const cwd = (ctx as { cwd?: string })?.cwd ?? process.cwd();
     const res = await runBashReadonly(params.command, cwd, signal);
+
+    // 记账（被策略/jail 拒的调用不产出内容，不计入预算）。
+    let text = res.text;
+    if (!res.rejected) {
+      // 跨过阈值：本次结果照常返回，但**附加**收敛提示（下一次调用会被上面的闸拒）。
+      if (chargeBudget(budget, text.length)) text += budgetCrossedNotice(budget);
+    }
+
     return {
-      content: [{ type: "text" as const, text: res.text }],
+      content: [{ type: "text" as const, text }],
       details: {
         command: params.command,
         rejected: res.rejected,
         ...(res.reason ? { reason: res.reason } : {}),
+        budgetUsedChars: budget.usedChars,
+        budgetLimitChars: SESSION_OUTPUT_CHAR_BUDGET,
       },
       ...(res.rejected ? { isError: true } : {}),
       // ★绝不设 addedToolNames：本工具不向会话引入任何新工具（防孙 agent）。
     };
   },
-});
+  });
+}
+
+/**
+ * 向后兼容的模块级单例（测试与非会话场景用）。**会话请用 createBashReadonlyTool() 各建一份**，
+ * 否则并行 proposer 会共享同一本账、互扣额度。
+ */
+export const bashReadonlyTool = createBashReadonlyTool();

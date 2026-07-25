@@ -21,6 +21,10 @@ providers:
     kind: openai
     baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1"
     apiKeyEnv: XIAOMI_API_KEY
+  deepseek:
+    kind: openai # api.deepseek.com = OpenAI 兼容（另有 /anthropic 端点，此处用 openai）
+    baseUrl: "https://api.deepseek.com"
+    apiKeyEnv: DEEPSEEK_API_KEY
 
 # 命名 preset（可自由增删多套组合，无需改代码）。
 presets:
@@ -29,9 +33,9 @@ presets:
     mode: synthesize
     quorum: all # 全成才放行；否则 fail-closed
     proposers:
+      - { provider: cliproxy, model: gemini-3.6-flash-high, profile: synthesize-worker }
       - { provider: minimax, model: MiniMax-M3, profile: synthesize-worker }
-      - { provider: xiaomi, model: mimo-v2.5-pro, profile: synthesize-worker }
-    aggregator: { provider: cliproxy, model: gpt-5.5, profile: synthesize-worker }
+    aggregator: { provider: deepseek, model: deepseek-v4-pro, profile: synthesize-worker }
 
   # moa_verify = verify（只读）：★聚合器也必须只读，profile 限 verify-worker /
   # delivery-readonly-worker（否则聚合器可写、只读被击穿，闭合审核🔴#1）。
@@ -39,17 +43,17 @@ presets:
     mode: verify
     quorum: all
     proposers:
+      - { provider: cliproxy, model: gemini-3.6-flash-high, profile: verify-worker }
       - { provider: minimax, model: MiniMax-M3, profile: verify-worker }
-      - { provider: xiaomi, model: mimo-v2.5-pro, profile: verify-worker }
-    aggregator: { provider: cliproxy, model: gpt-5.5, profile: verify-worker }
+    aggregator: { provider: deepseek, model: deepseek-v4-pro, profile: verify-worker }
 
 # 超时三嵌套（port PaperGo checkTimeoutInvariants，加载期强校验）：
 #   moaTotalBackstopMs ≥ aggregatorPerCallMs 且 ≥ referencePerCallMs；
 #   moaTotalBackstopMs ≥ max(referencePerCallMs) + aggregatorPerCallMs（并行取 max 再串 aggregator）。
 timeouts:
-  referencePerCallMs: 360000 # 每个 proposer 的 per_call
-  aggregatorPerCallMs: 480000 # 聚合器更宽：吃 N 份 proposal + 长输出
-  moaTotalBackstopMs: 900000 # MoA 总硬 backstop，覆盖整条串行链
+  referencePerCallMs: 540000 # 每个 proposer 的 per_call（2026-07-24 从 360000 上调 +50%：重推理 proposer 实测 177s 逼近旧顶）
+  aggregatorPerCallMs: 720000 # 聚合器更宽：吃 N 份 proposal + 长输出（从 480000 上调 +50%：实测 278s）
+  moaTotalBackstopMs: 1350000 # MoA 总硬 backstop，覆盖整条串行链（从 900000 上调 +50%；仍满足 ≥ max(ref)+agg=1260000 且 ≤ 30min 绝对上限）
 
 defaults:
   preset: default
