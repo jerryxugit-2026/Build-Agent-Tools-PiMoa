@@ -8,6 +8,8 @@ Give your coding agent a review panel: several models answer in parallel, one mo
 
 `Mixture-of-Agents` · `MCP server` · `TypeScript / Node ≥ 22` · `381 tests` · `macOS sandbox`
 
+**Releases**: [v2](https://github.com/jerryxugit-2026/Ai-learning/releases/tag/pimoa-v2) (current) · [v1](https://github.com/jerryxugit-2026/Ai-learning/releases/tag/pimoa-v1) ([README](https://github.com/jerryxugit-2026/Ai-learning/blob/pimoa-v1/PiMoa/README.md) · [source](https://github.com/jerryxugit-2026/Ai-learning/tree/pimoa-v1/PiMoa))
+
 ---
 
 <a name="english"></a>
@@ -303,6 +305,18 @@ cd Ai-learning/PiMoa && npm install
 - **verify 只看得到你给的 `cwd`** —— 这是沙箱的代价，也正是它的意义。
 - **行号现在可信了，但仍建议抽查** —— 这是习惯，不是不信任。
 - **开发侧工具** —— 给自己和同事用，没考虑暴露在公网上。
+
+---
+
+## Version history
+
+| Release | State | What it was |
+|---|---|---|
+| **[v2](https://github.com/jerryxugit-2026/Ai-learning/releases/tag/pimoa-v2)** | current | Made it finish on real work — recon前置, budgets, line numbers, de-biased aggregator. See the top of this README. |
+| [v1](https://github.com/jerryxugit-2026/Ai-learning/releases/tag/pimoa-v1) | superseded | First public cut: three MCP tools, fail-closed, macOS sandbox, 3 adversarial review rounds (4 RCEs fixed). Security was sound; **real workloads were not** — that's what v2 fixes. <br>📖 [v1 README](https://github.com/jerryxugit-2026/Ai-learning/blob/pimoa-v1/PiMoa/README.md) · 📁 [v1 source](https://github.com/jerryxugit-2026/Ai-learning/tree/pimoa-v1/PiMoa) |
+
+每个 release 都带完整源码快照（Source code zip/tar.gz），可直接下载当时的整个项目。
+Every release ships a full source snapshot, so any earlier version stays reachable and runnable.
 
 ---
 
