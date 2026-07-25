@@ -117,7 +117,8 @@ Claude / codex / antigravity（调用方）
    三个模型端点（分散，避免单点依赖）
    ├── proposer  MiniMax-M3     → https://api.minimaxi.com/anthropic        （Anthropic 协议，直连）
    ├── proposer  mimo-v2.5-pro  → https://token-plan-sgp.xiaomimimo.com/v1  （OpenAI 协议，直连）
-   └── aggregator gpt-5.5       → http://127.0.0.1:8317/v1                  （本地 CLIProxy）
+   └── aggregator deepseek-v4-pro → https://api.deepseek.com                （直连，1M 上下文）
+   （历史：proposer 2 曾用 xiaomi/mimo-v2.5-pro，现为 minimax/MiniMax-M3；`xiaomi` provider 仍在 `providers:` 段保留 endpoint，但当前**未被任何 preset 引用**）
 
 （moa_deliver 额外一步）→ <PIMOA_ROOT>/src/deliver/write.ts
         · 系统（非 LLM）原子写：同目录 tmp(wx) → fsync → rename
@@ -135,7 +136,7 @@ Claude / codex / antigravity（调用方）
 `loadConfig({ moaYaml })` → 读 YAML → 结构解析 → **加载期不变量强校验**，违反即 `throw ConfigError`（前缀 `[config]`）：
 1. preset 的 proposer + **aggregator** 的 provider 必须已注册；两者都必须带 `profile`。
 2. **verify preset 的 aggregator.profile ∈ {verify-worker, delivery-readonly-worker}**（防聚合器可写）。
-3. **`quorum` 锁死 `"all"`**，其它值拒绝（防误配破坏 fail-closed）。
+3. **`quorum` 分模式**（2026-07-25）：取值仅 `"all"` | `"tolerate-one"`，缺省 `"all"`；**verify 模式强制 `"all"`**（加载期拒绝其它值）。其它任何值（如数字 1）一律 fail-loud 拒绝（防误配破坏 fail-closed）。
 4. `apiKeyEnv` 指向的环境变量必须存在（避免运行时才 401）。
 5. 超时三嵌套：`moaTotalBackstopMs ≥ aggregatorPerCallMs`、`≥ referencePerCallMs`、`≥ max(reference)+aggregator`，且各值 ≤ 30 分钟绝对上限。
 6. `defaults.preset` 必须存在于 presets。
@@ -143,18 +144,24 @@ Claude / codex / antigravity（调用方）
 
 ### 4.3 `<PIMOA_ROOT>/src/moa/session.ts`（340 行）
 - `createIsolatedLoader(cwd, agentDir)`：`noExtensions/noSkills/noPromptTemplates/noThemes/noContextFiles` 全开 → **杜绝扩展注入工具**（防孙 agent 第二道闸）。
-- `PROFILE_TOOLS`：synthesize-worker=`[read,grep,find,ls]`；verify-worker=`[read,grep,find,ls,bash_readonly]`；delivery-readonly-worker=`[read,grep,find,ls]`。
+- `PROFILE_TOOLS`（2026-07-25 收紧）：synthesize-worker=**`[]`（无工具）**；verify-worker=`[read,ls,bash_readonly]`；delivery-readonly-worker=`[read,ls,bash_readonly]`。
+  · synthesize 去工具：大输入下 proposer 会自行扫库 → 多轮重发历史 → 上游断流吐空正文 → fail-closed。综合任务应就 `context`/`files` 作答。
+  · verify/delivery 去 pi 自带 `find`/`grep`（输出量 PiMoa 封不了顶，曾一次吐 5w+ 字符）：检索一律走 `bash_readonly` 的 rg / ast-grep / rtk（见 §4.8）。
+  · `read` 为**同名覆盖**的预算版（`src/tools/read_budgeted.ts`）：计入会话取证预算 + 路径 jail（pi 内置 read 无 jail）。
+  · **会话取证预算**（`src/tools/budget.ts`，read 与 bash_readonly 共用一本账）：**轮数 ≤5**、**输出 ≤20 万 token**，任一触顶即拒并要求模型立即出结论。
+  · **compaction 已打开**（M0 冒烟期误关一路带到生产）：主防线=上述预算闸，compaction 为最后兜底。
 - ★`SAFE_SESSION_TOOLS` + `assertNoGrandchildCapability(tools)`：**allowlist 强制**，越界即抛。拦 `subagent/delegate/task/moa_run/bash/execute_code/write`。
 - `runSession(...)`：**绝不抛**，所有失败折成 `{text,usage,costUsd,durationMs,timedOut,aborted,sawAgentEnd,sessionId,error}` 回传，判决交编排层。
 
 ### 4.4 `<PIMOA_ROOT>/src/moa/orchestrate.ts`（366 行）
 `runMoa(config, req, deps)`，`deps = {modelRuntime, signal?, runSessionImpl?, onStageEvent?}`（后两个为测试注入/观测，可选）。
-**不变量**：① proposer success 硬定义；② `quorum=all`；③ aggregator 正文直返不改写；④ 每次产 receipt。失败即 `status:"failed"` + `error{stage}`，**不产出、不降级**。
+**不变量**：① proposer success 硬定义；② **quorum 分模式**——verify 恒 `all`（任一失败即整体失败）；synthesize 可配 `tolerate-one`：允许**最多 1 个**失败且**成功数 ≥2**（少于 2 份不再是多模型交叉、退化成单模型答案，故仍拒），降级时**只把成功的 proposal 送进聚合**、`receipt.quorum` 诚实标注 `k/N (degraded)`、发 `quorum:degraded`（warning 级）事件；③ aggregator 正文直返不改写；④ 每次产 receipt。失败即 `status:"failed"` + `error{stage}`，**不产出、不降级**（`all` 语义；`tolerate-one` 下的降级是显式标注的例外）。
+> ⚠️ 兄弟 abort 与降级的交界（2026-07-25 MoA 自审实证的真缺陷，已修）：proposer 失败时 abort 兄弟会话用的 `sessionSignal` 与 aggregator **共用同一个 `internalAc`**，故原先的**无条件** abort 会让降级路径的 aggregator 一启动就 `aborted` ⇒ 降级形同虚设。现改为**按容忍额度**：`all` ⇒ 额度 0（首个失败即 abort，行为不变）；`tolerate-one` ⇒ 额度 1（第 2 个失败才 abort）。
 
 ### 4.5 `<PIMOA_ROOT>/src/mcp/{server.ts,tools.ts,events.ts}`
 - `server.ts`（234 行）：启动期 `loadConfig` + `ModelRuntime.create`，任一失败 **stderr + exit 1**（绝不带病启动）。注册三工具。**stdio 卫生**：绝不往 stdout 打日志（会破坏 MCP JSONL），全走 stderr / notification。在途追踪 + SIGTERM/SIGINT 优雅关闭。
 - `tools.ts`（277 行）：zod inputSchema、工具 description（含模式选择指引）、`runMoaTool` / `runMoaDeliverTool`。
-- `events.ts`（67 行）：`StageEvent` → `notifications/message`。事件序列示例：`proposer:started ×2 → proposer:done ×2 → quorum:gathered → aggregator:started → aggregator:done`。
+- `events.ts`（67 行）：`StageEvent` → `notifications/message`。事件序列示例：`proposer:started ×2 → proposer:done ×2 → quorum:gathered → aggregator:started → aggregator:done`。quorum 另有 `failed`（fail-closed）与 **`degraded`**（tolerate-one 降级放行，**warning 级**）两个 phase。
 
 ### 4.6 `<PIMOA_ROOT>/src/deliver/write.ts`（187 行）
 `atomicWriteWithVerify({path, body, doneMarker, allowedRoots})`：DONE marker 格式（`/^DONE_[A-Z0-9_]+$/`）→ 路径 jail（父目录 realpath 必须在 allowedRoots 下）→ 正文末非空行 === marker → 同目录 tmp `wx` 独占 → `fsync` → `rename` 原子替换 → **回读**核 SHA-256 + 末行 → 失败清理 tmp。
@@ -163,17 +170,52 @@ Claude / codex / antigravity（调用方）
 verify 的取证执行工具。**词法层**：任何未加引号的 `> < | ; & ( ) { } $ \` \\`、换行、控制字符一律拒；双引号内 `$ \` \\` 亦拒；命令名必须裸 basename。**命令层**：`ALLOWED_COMMANDS` allowlist（git/ls/cat/head/tail/grep/rg/stat/file/wc/readlink/realpath/du/df/find/sha256sum 等）+ 每命令 flag denylist + git 硬化注入（`GIT_CONFIG_NOSYSTEM` 等 + `--no-ext-diff --no-textconv`）+ 严格位置解析。**路径层**：每个非 flag 位置参数经 realpath 越界 jail（覆盖裸名）+ `nlink>1` 硬链接检测。**执行层（主 containment）**：`src/tools/sandbox.ts` 用 **macOS `sandbox-exec`** 跑——默认拒绝、无网络、读限 target+scratch、`deny file-read* $HOME`、写限 scratch、env 从零构建剥 key；`execFile(cmd, argv, {shell:false})` 不经 shell，git 走 CLT 绝对路径防 PATH 劫持，15s timeout。**非 darwin fail-closed 拒绝执行。**
 > ✅ 首轮实证的 4 条 RCE + 后续 11 项缺陷已全部修复并经独立复审（§8.2）。verify 现可**在沙箱内验证可利用性**（跑 `git diff`/`go vet` 等取证命令），执行被沙箱围死。
 
+### 4.8 验真检索矩阵：rg / ast-grep / rtk（2026-07-25 徐总，全量方案）★设计存档
+
+**动机**：早先 verify/synthesize 的 proposer 挂 pi 自带 `find`/`grep`——输出量 pi 说了算、PiMoa 封不了顶，一次 `find` 曾吐 5w+ 字符把对话吹爆 → 撞上游 gemini/antigravity `Stream ended without finish_reason` 间歇断流 → 正文空 → 2/2 fail-closed。修复分两步：① synthesize-worker 直接去掉全部工具（就 `context` 作答，见 §4.3）；② verify/delivery 的检索**全部改走沙箱内、封顶、可门控的工具**，并用三个正交工具替代 pi 自带 find/grep。
+
+**核心判断——不是三个竞争的搜索器，是三种正交的活**（各占一个动词 ⇒ 零重叠、零冲突）：
+
+| 活儿 | 工具 | 命令形态 | 说明 |
+|---|---|---|---|
+| 找文本 / 正则 / 找文件 | **`rg`** | `rg -n pat path`、`rg --files -g '*.ts'` | 已装（`/opt/homebrew/bin/rg`）+ 早在 allowlist + 已过安全审（`--pre/--config` 等 RCE flag 已拉黑）。跳 .gitignore/node_modules，按行匹配。**取代 grep 与 find。** |
+| 按代码结构找 | **`ast-grep`** | `ast-grep run -p 'pat' -l ts path` | npm 装（`/opt/homebrew/bin/ast-grep`，0.45）。懂语法、跳注释/字符串字面量、误报低，按 AST 节点匹配。 |
+| 紧凑地"读"内容 | **`rtk`** | `rtk read file`、`rtk ls .` | brew 装（`/opt/homebrew/bin/rtk`）。**压缩读取器**（省 60–90% token），不是搜索器。 |
+
+**模型决策树**（写进 `bashReadonlyTool` 说明，避免纠结）：① 找字符串/pattern 或列文件 → `rg`；② 找"长这样的代码"、想忽略注释与字符串 → `ast-grep`；③ 要**读**文件/内容、想省 token → `rtk read`。
+
+**冲突分析**：功能层——不会（各占一动词；关键是**不给 rtk 开 grep/find**，搜索只归 rg/ast-grep）；执行层——不会（每次 `bash_readonly` 只跑一条命令、独立沙箱进程）；安全层——三个二进制各有 flag 审。
+
+**沙箱可行性（2026-07-25 实测坐实，经 `buildSandboxedInvocation` 真沙箱跑）**：`rg` ✅、`ast-grep run` ✅、`rtk read`/`rtk ls` ✅；**`rtk git` ❌**（调 xcode git 壳要往系统 TMPDIR 写 xcrun 缓存，被"写限 scratch"挡，`code=129`）——故 **rtk 不碰 git**，git 仍走 §4.7 已硬化的 CLT 真二进制路径。
+
+**各工具门控（`bash_readonly_policy.ts`，仿 git 子命令白名单）**：
+- **`rg`**：维持既有 `RG_DENY_FLAGS`（`--pre/--pre-glob/--hostname-bin/--config` 及 `=value` 形态）。
+- **`ast-grep`**：仅放行默认 `run`（含裸 `-p` 起手）；裸词子命令必须是 `run`，`scan/new/test/lsp/completions` 一律拒（写盘/加载规则/常驻）；拉黑写/交互 flag `--rewrite / -U / --update-all / -i / --interactive / --json=... 之外的重写面`。
+- **`rtk`**：仿 git 严格子命令白名单——仅放 `read / ls / tree / json / wc`（纯读）；拒 `git`（沙箱跑不了）、`grep/find`（设计上归 rg/ast-grep）、以及 `err/test/summary/docker/kubectl/wget/aws/psql/pnpm/dotnet/gh/env/deps/smart/init`（**任意命令执行/网络/写配置**——rtk 本质是命令代理，这几个子命令等于 `bash -c`，必须全拒）；拒一切前置全局 flag。
+
+**白名单变更**：`find`、`grep` 从 `ALLOWED_COMMANDS` **删除**（rg 全替代）；新增 `rtk`、`ast-grep`。（**注**：`ast-grep` 的官方别名 `sg` **未列入 allowlist**——`analyzeCommand` 只按字面首 token 匹配、不做别名映射，故 `sg run …` 会被拒；请一律写 `ast-grep`。）
+
+**profile 生效范围**：synthesize-worker=`[]`（不变，无工具）；verify-worker、delivery-readonly-worker=`[read, ls, bash_readonly]`（bash_readonly 内部即 rg/ast-grep/rtk 三选一）。
+
+**对抗复审（2026-07-25，独立审计代理，实证）**：扩 allowlist（+rtk +ast-grep）经一轮对抗审。结论 🟠→修复后收口：
+> - **[已修] #7 ast-grep `-c` 短别名绕过**：denylist 原只列 `--config`，漏其文档化短别名 `-c` → `ast-grep run -c evil.yml` 可加载任意 sgconfig → customLanguages 动态库 RCE。修：ast-grep 分支拒 `-c` 起手全形态（`-c`/`-c=x`/`-cx`）。
+> - **[已修] #8 sgconfig.yml 自动发现 + customLanguages 动态库**：ast-grep 自动加载 cwd/祖先的 `sgconfig.yml`，其 `libraryPath` 指向的 `.dylib` 在 dlopen 时执行构造函数——命令行不引用它，故 checkPathJail 覆盖不到。修：`bash_readonly.ts:astGrepConfigJail` 执行前扫审计根 `sgconfig.{yml,yaml}`，含 `customLanguages/libraryPath` 即拒（沙箱内祖先不可读，故只需守 cwd 根）。
+> - **顶住（无需修）**：rtk 子命令白名单、rtk 本地 filter 的 `trust` 门控（沙箱内 HOME=scratch 空 → 敌意 filter 被跳过）、路径 jail 三检测（越界/nlink/symlink）、ast-grep 子命令与 `-U/-r/-i` denylist。**沙箱主 containment 实测 airtight**：即便 dlopen 执行攻击者原生代码，也读不到 `$HOME`/密钥、无网络出站、写不出 scratch、env 无 key——未能实证任何外泄/落盘/逃逸。
+> - **残余（低危·可接受）**：`rtk ls -la` 会回显 symlink 的目标绝对路径（元数据侧信道；内容读仍被 jail 拦）。`process-exec*` 允许下 dlopen 原生代码是既定风险面，主 containment = 沙箱（与 §8.3 git textconv 残余同性质）。
+> 5 条 fix 回归测试并入 `test/bash_readonly.test.ts`（含 `-c` 全形态 + sgconfig jail live）。
+
 ---
 
 ## 5. 配置与密钥
 
 ### 5.1 `<PIMOA_ROOT>/config/moa.yaml`
-定义 `providers`（cliproxy / minimax / xiaomi 的 kind+baseUrl+apiKeyEnv）、`presets`（`default`=synthesize、`moa_verify`=verify）、`timeouts`（reference 360000 / aggregator 480000 / backstop 900000 ms；2026-07-24 从 180/720 上调——两个慢 reasoning proposer + 沙箱取证在 180s 撞顶）、`defaults.preset`。
+定义 `providers`（cliproxy / minimax / xiaomi 的 kind+baseUrl+apiKeyEnv）、`presets`（`default`=synthesize、`moa_verify`=verify）、`timeouts`（reference 540000 / aggregator 720000 / backstop 1350000 ms；2026-07-24 各 +50%——重推理 proposer 实测 177s、聚合 278s 逼近旧顶）、`defaults.preset`。
 新增模型组合**只改本文件**，代码零改动。
 
 ### 5.2 `<PIMOA_ROOT>/config/models.json`
 pi `ModelRuntime` 的模型注册表——**这是运行期真正生效的 endpoint 与 key 引用**：
-- `cliproxy` → `http://127.0.0.1:8317/v1`，`api: openai-completions`，`apiKey: "$CLIPROXY_API_KEY"`，模型 `gpt-5.5`
+- `cliproxy` → `http://127.0.0.1:8317/v1`，`api: openai-completions`，`apiKey: "$CLIPROXY_API_KEY"`，模型 `gpt-5.5` / `gemini-3.6-flash-high`
+- `deepseek` → `https://api.deepseek.com`，`api: openai-completions`，`apiKey: "$DEEPSEEK_API_KEY"`，模型 `deepseek-v4-pro`（**当前聚合器**，1M 上下文 / maxTokens 65536——推理模型需足够输出预算，否则推理吃光→空正文）
 - `minimax` → `https://api.minimaxi.com/anthropic`，`api: anthropic-messages`，`apiKey: "$MINIMAX_API_KEY"`，模型 `MiniMax-M3`
 - `xiaomi` → `https://token-plan-sgp.xiaomimimo.com/v1`，`api: openai-completions`，`apiKey: "$XIAOMI_API_KEY"`，模型 `mimo-v2.5-pro`
 
@@ -181,7 +223,8 @@ pi `ModelRuntime` 的模型注册表——**这是运行期真正生效的 endpo
 
 | 环境变量 | 用于 | 说明 |
 |---|---|---|
-| `CLIPROXY_API_KEY` | 本地 CLIProxy（gpt-5.5 聚合器） | 本地代理接受任意值，`dummy` 即可 |
+| `CLIPROXY_API_KEY` | 本地 CLIProxy（gemini proposer / gpt-5.5） | 本地代理接受任意值，`dummy` 即可 |
+| `DEEPSEEK_API_KEY` | DeepSeek 直连（**当前聚合器**） | 启动器自动从 `~/.hermes/config.yaml` 读 |
 | `MINIMAX_API_KEY` | MiniMax-M3 直连 | 需真实 key |
 | `XIAOMI_API_KEY` | mimo-v2.5-pro 直连 | 需真实 key |
 
@@ -234,7 +277,7 @@ npx tsx src/mcp/server.ts
   }
 }
 ```
-> **调用方超时必须 ≥ `moaTotalBackstopMs`（900000ms）**，否则调用方会先掐断整个 MoA。
+> **调用方超时必须 ≥ `moaTotalBackstopMs`（1350000ms）**，否则调用方会先掐断整个 MoA。（本机 Codex `tool_timeout_sec=1410`。）
 > 调用方需支持 `notifications/message`（capabilities.logging）才能收到分阶段实时通知；不支持则静默降级。
 
 ### 6.4 三个工具的入参
@@ -339,6 +382,7 @@ npx tsx test/security.test.ts           # 10（防孙 agent allowlist）
 | 防孙 agent 安全不变量 | ✅ |
 | 确定性交付 moa_deliver | ✅ |
 | verify **沙箱内可执行**（bash_readonly + macOS sandbox-exec） | ✅ 可查可利用性、执行被沙箱围死 |
+| **检索矩阵 rg / ast-grep / rtk（§4.8，2026-07-25）** | ✅ 已落地 + **已过对抗复审**：删 find/grep、加 ast-grep(0.45)+rtk(0.43) 门控、verify+delivery 生效；独立审计代理实证 2 项 🟠（ast-grep `-c` 短别名 / sgconfig 动态库自动发现）**已修 + 回归测试**，沙箱主 containment 实测 airtight；341 测试全绿 + tsc 干净 |
 | 资源回收三层 + 优雅关闭 | ✅ |
 | 对抗审 3 轮（Claude reviewer + Hermes MoA verify + 独立复审） | ✅ 完成 |
 | P0/P1 漏洞修复（15 项，见 §8.2） | ✅ 全修 + 逐条重审确认 |

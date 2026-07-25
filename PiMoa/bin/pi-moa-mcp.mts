@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { parse } from "yaml";
 
 process.env.CLIPROXY_API_KEY ||= "dummy";
-if (!process.env.MINIMAX_API_KEY || !process.env.XIAOMI_API_KEY) {
+if (!process.env.MINIMAX_API_KEY || !process.env.XIAOMI_API_KEY || !process.env.DEEPSEEK_API_KEY) {
   try {
     const cfg = parse(readFileSync(join(homedir(), ".hermes/config.yaml"), "utf8"));
     const walk = (o: any) => {
@@ -19,6 +19,7 @@ if (!process.env.MINIMAX_API_KEY || !process.env.XIAOMI_API_KEY) {
           const id = `${o.provider || ""}${o.model || ""}${o.base_url || ""}`.toLowerCase();
           if (/minimax/.test(id) && !process.env.MINIMAX_API_KEY) process.env.MINIMAX_API_KEY = String(o.api_key);
           if (/(xiaomi|mimo)/.test(id) && !process.env.XIAOMI_API_KEY) process.env.XIAOMI_API_KEY = String(o.api_key);
+          if (/deepseek/.test(id) && !process.env.DEEPSEEK_API_KEY) process.env.DEEPSEEK_API_KEY = String(o.api_key);
         }
         for (const v of Object.values(o)) walk(v);
       }

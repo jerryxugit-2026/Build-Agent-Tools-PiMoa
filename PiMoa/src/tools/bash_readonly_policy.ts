@@ -44,16 +44,24 @@ export const ALLOWED_COMMANDS: ReadonlySet<string> = new Set([
   "du",
   "df",
   // 目录 / 内容只读查看
-  "find",
   "ls",
   "cat",
   "head",
   "tail",
-  "grep",
   "rg",
   "pwd",
   "echo",
+  // ── 检索矩阵（2026-07-25 徐总，全量方案，见架构文档 §4.8）──
+  // find/grep 已下线：文本/找文件→rg；代码结构→ast-grep；紧凑读→rtk。三者子命令/flag 再收窄（见下）。
+  "ast-grep",
+  "rtk",
 ]);
+
+/** 已下线命令 → 引导替代（find/grep 归 rg/ast-grep/rtk，§4.8）。给可执行提示而非干拒。 */
+const REMOVED_COMMAND_HINTS: Record<string, string> = {
+  grep: "grep 已下线：文本搜索改用 `rg`（更快、跳 .gitignore、输出紧凑、已过安全审）",
+  find: "find 已下线：找文件用 `rg --files -g '<glob>'`；找代码结构用 `ast-grep run -p '<模式>' -l <lang>`；紧凑列目录用 `rtk ls`",
+};
 
 /** `git` 只放行只读子命令（写子命令 commit/checkout/config/tag/... 一律拒）。 */
 export const GIT_READONLY_SUBCOMMANDS: ReadonlySet<string> = new Set([
@@ -140,18 +148,31 @@ const FILE_DENY_FLAGS: ReadonlySet<string> = new Set([
   "--magic-file",
 ]);
 
-/** `find` 的写/执行动作 flag（无结构元字符也能删/改/跑）。命中即拒。 */
-const FIND_DENY_FLAGS: ReadonlySet<string> = new Set([
-  "-exec",
-  "-execdir",
-  "-ok",
-  "-okdir",
-  "-delete",
-  "-fprint",
-  "-fprint0",
-  "-fprintf",
-  "-fls",
+/**
+ * `rtk` 只放行**纯读**子命令。rtk 本质是命令代理——`err/test/summary/docker/kubectl/wget/aws/psql/
+ * pnpm/dotnet/gh/env/deps/smart/init` 能任意执行命令/联网/写配置（等于 `bash -c`），`git` 在沙箱内因
+ * xcrun 缓存写被拒（沙箱可行性实测 code=129），`grep/find` 归 rg/ast-grep —— 均**不列入**。
+ */
+export const RTK_READONLY_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  "read",
+  "ls",
+  "tree",
+  "json",
+  "wc",
 ]);
+
+/** `ast-grep` 唯一放行子命令（默认命令，裸 `-p` 起手亦走它）。scan/new/test/lsp/completions 写盘/加载规则/常驻 → 拒。 */
+const ASTGREP_ALLOWED_SUBCOMMAND = "run";
+/** `ast-grep run` 的写/交互/外部配置 flag：改代码 / 原地更新 / 交互式应用 / 加载外部 sgconfig，一律拒（保持纯只读搜索）。 */
+const ASTGREP_DENY_FLAGS: readonly string[] = [
+  "-U",
+  "--update-all",
+  "-r",
+  "--rewrite",
+  "-i",
+  "--interactive",
+  "--config",
+];
 
 /** `tail -f` 类会阻塞挂起（非安全但会吊死 headless 会话），一并拒。 */
 const TAIL_DENY_FLAGS: ReadonlySet<string> = new Set(["-f", "-F", "--follow"]);
@@ -324,7 +345,7 @@ export function analyzeCommand(command: string): AnalyzeResult {
   if (!ALLOWED_COMMANDS.has(name)) {
     return {
       allowed: false,
-      reason: `命令 '${name}' 不在只读取证 allowlist`,
+      reason: REMOVED_COMMAND_HINTS[name] ?? `命令 '${name}' 不在只读取证 allowlist`,
     };
   }
 
@@ -359,10 +380,53 @@ export function analyzeCommand(command: string): AnalyzeResult {
     }
     injected.push(...args.slice(1));
     return { allowed: true, argv: injected };
-  } else if (name === "find") {
+  } else if (name === "rtk") {
+    // rtk 是命令代理（§4.8）：仿 git 严格子命令白名单——只放纯读 read/ls/tree/json/wc，
+    // 拒一切前置全局 flag 与其余子命令（git 沙箱跑不了、grep/find 归 rg/ast-grep、err/test/
+    // summary/docker/... 能任意执行）。子命令后仅路径参数（越界/硬链接由 bash_readonly.ts jail 兜）。
+    if (args.length === 0) {
+      return { allowed: false, reason: "rtk 缺子命令被拒" };
+    }
+    const sub = args[0];
+    if (sub.startsWith("-")) {
+      return {
+        allowed: false,
+        reason: `rtk 前置全局 flag '${sub}' 被拒（子命令必须紧跟 rtk）`,
+      };
+    }
+    if (!RTK_READONLY_SUBCOMMANDS.has(sub)) {
+      return {
+        allowed: false,
+        reason: `rtk 子命令 '${sub}' 非纯读或沙箱不可用，被拒（仅放 ${[...RTK_READONLY_SUBCOMMANDS].join("/")}；搜索用 rg/ast-grep、git 走 bash_readonly 的 git）`,
+      };
+    }
+  } else if (name === "ast-grep") {
+    // 只放只读搜索：默认 run（裸 -p 起手）或显式 `run`；scan/new/test/lsp/completions（写盘/加载
+    // 规则/常驻）一律拒。写/交互/外部配置 flag 拒（保持纯只读搜索，不改代码、不载 sgconfig）。
+    const first = args[0];
+    if (first !== undefined && !first.startsWith("-") && first !== ASTGREP_ALLOWED_SUBCOMMAND) {
+      return {
+        allowed: false,
+        reason: `ast-grep 子命令 '${first}' 被拒（仅放只读搜索 'run' 或裸 -p 起手；scan/new/test/lsp 会写盘/加载规则/常驻）`,
+      };
+    }
     for (const a of args) {
-      if (FIND_DENY_FLAGS.has(a)) {
-        return { allowed: false, reason: `find 写/执行动作 '${a}' 被拒` };
+      // ★对抗审 #7：`--config` 的**短别名 `-c`**（全形态 `-c` / `-c=x` / `-cx` 粘连取值）——
+      //   漏它即可 `ast-grep run -c evil.yml` 加载任意 sgconfig → customLanguages 动态库 RCE。
+      //   ast-grep run 里小写 `-c` 唯一含义即 config（上下文是大写 -A/-B/-C），故 `-c` 起手一律拒。
+      if (a.startsWith("-c")) {
+        return {
+          allowed: false,
+          reason: `ast-grep 外部配置参数 '${a}'（-c=--config 短别名）被拒（可加载任意 sgconfig/动态库）`,
+        };
+      }
+      for (const bad of ASTGREP_DENY_FLAGS) {
+        if (a === bad || a.startsWith(bad + "=")) {
+          return {
+            allowed: false,
+            reason: `ast-grep 写/交互/外部配置参数 '${a}' 被拒（保持纯只读搜索，不改代码/不载外部 sgconfig）`,
+          };
+        }
       }
     }
   } else if (name === "rg") {

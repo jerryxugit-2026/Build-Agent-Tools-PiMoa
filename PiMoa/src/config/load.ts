@@ -12,6 +12,7 @@ import type {
 	ProfileName,
 	ProviderCfg,
 	ProviderKind,
+	Quorum,
 	Timeouts,
 	WorkerRef,
 } from "./types.js";
@@ -116,12 +117,19 @@ function parsePreset(raw: unknown, key: string): Preset {
 			`presets.${key}.mode 非法："${mode}"，仅允许 ${MODES.join(" | ")}`,
 		);
 	}
-	// 不变量③：quorum 锁死 = "all"，拒绝更小值 fail-loud。
-	if (o.quorum !== "all") {
+	// 不变量③（2026-07-25 分模式）：quorum ∈ {"all","tolerate-one"}，缺省 "all"（安全默认+向后兼容）；
+	//   **verify 强制 "all"**。其它值（如数字 1）一律 fail-loud 拒绝（防误配破坏 fail-closed，P0-5）。
+	const quorumRaw = o.quorum === undefined ? "all" : o.quorum;
+	if (quorumRaw !== "all" && quorumRaw !== "tolerate-one") {
 		throw new ConfigError(
-			`presets.${key}.quorum 必须锁死为 "all"（全部 proposer 成功才放行），实际为 ${JSON.stringify(
-				o.quorum,
-			)}；配置化误配（如 1）会破坏 fail-closed（P0-5）`,
+			`presets.${key}.quorum 必须是 "all" 或 "tolerate-one"，实际为 ${JSON.stringify(o.quorum)}；` +
+				"配置化误配（如数字 1）会破坏 fail-closed（P0-5）",
+		);
+	}
+	if (mode === "verify" && quorumRaw !== "all") {
+		throw new ConfigError(
+			`presets.${key}.quorum 在 verify 模式下必须为 "all"，实际为 ${JSON.stringify(quorumRaw)}；` +
+				"验真的价值在独立交叉核验——少一个验证者则「多方分别核对过」的前提不成立，降级等于假装安全",
 		);
 	}
 	if (!Array.isArray(o.proposers) || o.proposers.length === 0) {
@@ -131,7 +139,7 @@ function parsePreset(raw: unknown, key: string): Preset {
 		parseWorkerRef(p, `presets.${key}.proposers[${i}]`),
 	);
 	const aggregator = parseWorkerRef(o.aggregator, `presets.${key}.aggregator`);
-	return { mode: mode as Mode, quorum: "all", proposers, aggregator };
+	return { mode: mode as Mode, quorum: quorumRaw as Quorum, proposers, aggregator };
 }
 
 function parseTimeouts(raw: unknown): Timeouts {
