@@ -22,7 +22,7 @@ v1's failure mode was consistent and infuriating: ask MoA to review a real modul
 
 | Symptom | Root cause found | Fix |
 |---|---|---|
-| Proposer returns empty text, whole run fails | Open-ended task → model **scans the whole repo** on its own | **Recon前置**: pass `files` (exact list) or `recon_query` (server-side `rg`) |
+| Proposer returns empty text, whole run fails | Open-ended task → model **scans the whole repo** on its own | **Server-side recon**: pass `files` (exact list) or `recon_query` (server-side `rg`) |
 | 14k-token task balloons to **251k tokens** | Every tool call **resends the entire history**. 17.8× amplification, measured | Hard cap: **5 tool calls** + **200k-token** forensics budget per session |
 | Cited line numbers off by ~130 lines | We fed the model **bare code** — it had to *count* lines | Feed code **with real line numbers** (`688| func …`); it copies instead of counting |
 | One slow model drags everything | `MiniMax-M3` emitted **10,902 chars** (others: 350–540) at 28–36s | Cap its `maxTokens` → **4,305 chars / 21s**, no empty output |
@@ -312,7 +312,7 @@ cd Ai-learning/PiMoa && npm install
 
 | Release | State | What it was |
 |---|---|---|
-| **[v2](https://github.com/jerryxugit-2026/Ai-learning/releases/tag/pimoa-v2)** | current | Made it finish on real work — recon前置, budgets, line numbers, de-biased aggregator. See the top of this README. |
+| **[v2](https://github.com/jerryxugit-2026/Ai-learning/releases/tag/pimoa-v2)** | current | Made it finish on real work — server-side recon, budgets, line numbers, de-biased aggregator. See the top of this README. |
 | [v1](https://github.com/jerryxugit-2026/Ai-learning/releases/tag/pimoa-v1) | superseded | First public cut: three MCP tools, fail-closed, macOS sandbox, 3 adversarial review rounds (4 RCEs fixed). Security was sound; **real workloads were not** — that's what v2 fixes. <br>📖 [v1 README](https://github.com/jerryxugit-2026/Ai-learning/blob/pimoa-v1/PiMoa/README.md) · 📁 [v1 source](https://github.com/jerryxugit-2026/Ai-learning/tree/pimoa-v1/PiMoa) |
 
 每个 release 都带完整源码快照（Source code zip/tar.gz），可直接下载当时的整个项目。
