@@ -1,4 +1,4 @@
-# agent-tools
+# AI-Agent-Tools-PiMoa
 
 Two MCP servers, built because I needed them: one keeps an AI agent from
 wrecking your spreadsheet, the other makes several models argue before
@@ -43,7 +43,7 @@ PiMoa/   server, docs (EN/中文), v2 notes
 ## Why these live next to a paper about unemployment
 
 The same profile that ships these tools also hosts
-[ai-and-employment](https://github.com/jerryxugit-2026/ai-and-employment),
+[AI-and-Employment](https://github.com/jerryxugit-2026/AI-and-Employment),
 a working paper on what automating entry-level information work does to
 the people who used to do it. That's deliberate. Building the tools and
 counting their cost are the same job done honestly.
