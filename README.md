@@ -48,6 +48,9 @@ a working paper on what automating entry-level information work does to
 the people who used to do it. That's deliberate. Building the tools and
 counting their cost are the same job done honestly.
 
+*Dates, plainly: these tools were built and rebuilt across 2025–2026;
+this repository is where they live now, since June 2026.*
+
 ---
 
 *One of four directions on [my profile](https://github.com/jerryxugit-2026) —
