@@ -3,6 +3,7 @@
 import { analyzeCommand, tokenize } from "../src/tools/bash_readonly_policy.ts";
 import { runBashReadonly } from "../src/tools/bash_readonly.ts";
 import { resolve as resolveP } from "node:path";
+if (!process.env.PIMOA_DEVKB_ROOT) { console.log("SKIP: set PIMOA_DEVKB_ROOT (an indexed repository) to run this test"); process.exit(0); }
 
 let pass = 0;
 let fail = 0;
@@ -173,8 +174,10 @@ console.log("── 会话级检索预算（20 万 token 顶，超顶拒绝继�
 await (async () => {
   const { createBashReadonlyTool, createRetrievalBudget, SESSION_OUTPUT_CHAR_BUDGET, SESSION_TOKEN_BUDGET } =
     await import("../src/tools/bash_readonly.ts");
-  ok(SESSION_TOKEN_BUDGET === 200_000, "预算 = 20 万 token");
-  ok(SESSION_OUTPUT_CHAR_BUDGET === 600_000, "≈60 万字符（3 字符/token）");
+  // v4 §4(2026-08-25):预算改字符本位单一货币(limits.ts retrievalCharBudget,缺省 240k 字符)。
+  // 旧口径 200k token×3=600k 字符与材料预算 1:1 混币,最坏口径超窗 35%(审查 A1),已废除。
+  ok(SESSION_OUTPUT_CHAR_BUDGET === 240_000, "预算 = 24 万字符(字符本位,limits.ts 真源)");
+  ok(SESSION_TOKEN_BUDGET === Math.round(SESSION_OUTPUT_CHAR_BUDGET / 3), "token 数仅为近似显示口径");
 
   const budget = createRetrievalBudget();
   const tool: any = createBashReadonlyTool(budget);
@@ -299,6 +302,21 @@ await (async () => {
   // 无入参 ⇒ 零开销
   const r4 = await runRecon({ cwd });
   ok(r4.text === "" && r4.filesIncluded === 0, "无 files/query：不产生任何附加内容");
+})();
+
+// ---------- 检索分流铁律：Paper System 根下的 rg / ast-grep 拒并指向 devkb_search（2026-09-20 灰度第 3 轮）----------
+await (async () => {
+  const { paperSystemSearchRoots } = await import("../src/tools/bash_readonly.ts");
+  const { PAPER_SYSTEM_ROOT } = await import("../src/tools/devkb_search.ts");
+  const here = process.cwd(); // PiMoa 仓
+  ok(paperSystemSearchRoots(["rg", "-n", "foo", "."], PAPER_SYSTEM_ROOT).length === 1, "cwd 在 Paper System 内、rg . → 命中分流");
+  ok(paperSystemSearchRoots(["rg", "-n", "foo"], PAPER_SYSTEM_ROOT).length === 1, "cwd 在 Paper System 内、rg 无路径参数（搜索根=cwd）→ 命中");
+  ok(paperSystemSearchRoots(["rg", "-n", "foo", PAPER_SYSTEM_ROOT + "/cmd"], here).length === 1, "cwd 在 PiMoa、路径参数指向 Paper System 子目录 → 命中");
+  ok(paperSystemSearchRoots(["rg", "-n", "foo", "."], here).length === 0, "cwd 在 PiMoa、rg . → 不命中");
+  ok(paperSystemSearchRoots(["cat", PAPER_SYSTEM_ROOT + "/go.mod"], here).length === 0, "非检索命令（cat）不受分流约束");
+  ok(paperSystemSearchRoots(["ast-grep", "run", "-p", "f($$$)", "-l", "go", PAPER_SYSTEM_ROOT], here).length === 1, "ast-grep 指向 Paper System 根 → 命中");
+  const r = await runBashReadonly("rg -n isProposalOk .", PAPER_SYSTEM_ROOT);
+  ok(r.rejected === true && /检索分流/.test(r.text) && /devkb_search/.test(r.text), `runBashReadonly 在 Paper System 内 rg 被拒并指路：${r.text.slice(0, 80)}`);
 })();
 
 console.log(`\n[bash_readonly-test] 通过 ${pass} / 失败 ${fail}`);

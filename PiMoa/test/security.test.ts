@@ -26,7 +26,9 @@ console.log("[security-test] allowlist =", [...SAFE_SESSION_TOOLS]);
 
 // 放行：allowlist 内的只读工具
 ok(!throws([]), "空工具集放行");
-ok(!throws(["read", "ls", "bash_readonly"]), "现行只读工具集放行（read/ls/bash_readonly）");
+ok(!throws(["read", "ls", "bash_readonly", "semble_search"]), "现行只读工具集放行（含 semble_search）");
+ok(!throws(["semble_search"]), "受限 semble_search 放行");
+ok(!throws(["devkb_search"]), "受限 devkb_search 放行（Paper System 分流铁律工具面）");
 // ★grep/find 已全面下线（检索改走 rg / ast-grep / rtk，见架构 §4.8）：SAFE_SESSION_TOOLS 同步不再放行，
 //   防止日后误把它们加回某 profile 时本闸失灵（2026-07-25 MoA 自审发现的纵深防御缺口）。
 ok(throws(["read", "grep"]), "已下线的 grep 被 allowlist 拒");
@@ -41,6 +43,8 @@ ok(throws(["bash"]), "未受控 bash 拦截");
 ok(throws(["execute_code"]), "execute_code 拦截");
 ok(throws(["read", "bash"]), "混入一个危险工具即整体拦截");
 ok(throws(["write"]), "write 拦截");
+ok(throws(["mcp__semble__search"]), "原始 MCP semble 工具拦截（防递归扇出）");
+ok(throws(["mcp__devkb__devkb_find"]), "原始 MCP devkb 工具拦截（防递归扇出）");
 
 console.log(`[security-test] 通过 ${pass} / 失败 ${fail}`);
 if (fail > 0) process.exit(1);

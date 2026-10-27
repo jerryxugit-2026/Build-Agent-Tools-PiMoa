@@ -1,0 +1,72 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { JEVCHECK_DEFAULTS, loadConfig } from "../src/config/load.js";
+import { historicalMaterialGapHints } from "../src/moa/jevcheck.js";
+import { buildProposerPrompt } from "../src/moa/orchestrate.js";
+import type { MoaRequest } from "../src/moa/types.js";
+
+const root = fileURLToPath(new URL("..", import.meta.url));
+const tmp = mkdtempSync(join(tmpdir(), "jevbatch12-"));
+try {
+  const spool = join(tmp, "spool");
+  mkdirSync(spool);
+  const gap = (kind: string, need: string) => ({ kind, need: [need], id: `test-${need}` });
+  const round = (index: number, records: unknown, broken = false) => {
+    const file = join(spool, `round-${index}.md`);
+    writeFileSync(file, `## receipt\n\n\`\`\`json\n${broken ? "{bad json" : JSON.stringify({ gaps: { records } })}\n\`\`\`\n`);
+    utimesSync(file, new Date(1_700_000_000_000 + index * 1000), new Date(1_700_000_000_000 + index * 1000));
+  };
+  round(1, [gap("locate-fail", "expired")]);
+  round(2, [gap("locate-fail", "second-expired")]);
+  round(3, [gap("locate-fail", "recent"), gap("chain-evidence-missing", "chain-hop"), gap("locate-fail", "older-window-only")]);
+  round(4, [gap("locate-fail", "recent"), gap("entail-low", "semantic-skip")]);
+  round(5, [gap("quote-ambiguous", "quote-skip"), gap("ask-fault", "ask-skip")]);
+  round(6, [gap("locate-fail", "keep-after-bad-json")], true);
+  round(7, Array.from({ length: 14 }, (_, i) => gap("locate-fail", `need-${i}`)));
+  const hints = historicalMaterialGapHints(spool);
+  assert.match(hints, /历史材料缺口提示（仅供取证，不是事实断言）/);
+  assert.equal((hints.match(/^- 请核查并按需补充材料：/gm) ?? []).length, 10, "hard cap");
+  assert(hints.includes("need-0") && hints.includes("need-9"));
+  assert(!hints.includes("need-10") && !hints.includes("recent"), "newest-first cap");
+  round(7, [gap("locate-fail", "recent"), gap("chain-evidence-missing", "chain-hop")]);
+  const dedup = historicalMaterialGapHints(spool);
+  assert.equal((dedup.match(/请核查并按需补充材料：recent/g) ?? []).length, 1);
+  assert.equal((dedup.match(/请核查并按需补充材料：chain-hop/g) ?? []).length, 1);
+  assert(dedup.includes("older-window-only"), "a unique need in the fifth newest round survives TTL");
+  assert(!dedup.includes("expired") && !dedup.includes("semantic-skip") && !dedup.includes("quote-skip") && !dedup.includes("ask-skip"));
+  assert.equal(historicalMaterialGapHints(join(tmp, "missing")), "", "missing spool silently degrades");
+  const malformed = join(tmp, "malformed");
+  mkdirSync(malformed);
+  writeFileSync(join(malformed, "bad.md"), "## receipt\n\n```json\n{bad json\n```\n");
+  assert.equal(historicalMaterialGapHints(malformed), "", "bad JSON silently degrades");
+  const request = { prompt: "审核本轮代码", context: "  附件片段  " } as MoaRequest;
+  const oldPrompt = "附件片段\n\n===== 你的任务 =====\n审核本轮代码";
+  assert.equal(buildProposerPrompt(request, 0), oldPrompt, "off byte snapshot");
+  assert.equal(buildProposerPrompt(request, 0, false, false, false, false, false, ""), oldPrompt);
+  const offFull = buildProposerPrompt(request, 3, true, false, false, false, false);
+  assert.equal(createHash("sha256").update(offFull).digest("hex"),
+    "71aa91b14c2d79d45043aa3ecaff733d5b7d67890666abaea891bad6fe52e98a", "off full-prompt byte snapshot");
+  assert.equal(offFull.includes("历史材料缺口提示"), false);
+  assert.equal(buildProposerPrompt(request, 3, true, false, false, false, false, dedup).endsWith(`\n\n${dedup}`), true);
+  assert.equal(JEVCHECK_DEFAULTS.gapCarryForward?.enabled, false);
+  for (const key of ["CLIPROXY_API_KEY", "MINIMAX_API_KEY", "XIAOMI_API_KEY", "DEEPSEEK_API_KEY"]) process.env[key] ??= "test-only";
+  const configFile = join(root, "config", "moa.yaml");
+  const modelsJson = join(root, "config", "models.json");
+  const source = readFileSync(configFile, "utf8");
+  assert.equal((source.match(/gapCarryForward: \{ enabled: (?:true|false) \}/g) ?? []).length, 1, "fixture replacement anchor");
+  const fixture = source.replace(/gapCarryForward: \{ enabled: (?:true|false) \}/, "gapCarryForward: { enabled: false }");
+  const candidate = join(tmp, "moa.yaml");
+  writeFileSync(candidate, fixture);
+  assert.equal(loadConfig({ moaYaml: candidate, modelsJson }).jevcheck.gapCarryForward?.enabled, false);
+  writeFileSync(candidate, fixture.replace("gapCarryForward: { enabled: false }", "gapCarryForward: { enabled: true }"));
+  assert.equal(loadConfig({ moaYaml: candidate, modelsJson }).jevcheck.gapCarryForward?.enabled, true);
+  writeFileSync(candidate, fixture.replace("gapCarryForward: { enabled: false }", "gapCarryForward: { enabled: nope }"));
+  assert.throws(() => loadConfig({ moaYaml: candidate, modelsJson }), /jevcheck\.gapCarryForward\.enabled/);
+  console.log("jevbatch12 gap carry-forward fixtures and prompt snapshots: PASS");
+} finally {
+  rmSync(tmp, { recursive: true, force: true });
+}

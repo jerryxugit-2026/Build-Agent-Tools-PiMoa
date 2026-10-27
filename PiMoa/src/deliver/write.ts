@@ -45,9 +45,11 @@ export interface AtomicWriteResult {
   path: string;
 }
 
-function sha256(text: string): string {
+/** 文本 sha256(hex)。导出供 spool 审计对账复用(v4 §10-B)。 */
+export function sha256Text(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
+const sha256 = sha256Text;
 
 /** realpath 解析；解析不了（不存在）则退回 resolve 绝对路径。 */
 function realpathOrSelf(p: string): string {
@@ -122,6 +124,42 @@ function resolveJailedTarget(path: string, allowedRoots: string[]): string {
     );
   }
   return join(realParent, name);
+}
+
+/**
+ * 低层原子写(临时文件→fsync→rename),**无 doneMarker、无路径 jail**(v4 §10-B 抽层)。
+ * 仅供服务端自管目录(如 spool)使用;交付路径必须走 atomicWriteWithVerify(带 jail+回读)。
+ * 目标父目录必须已存在。失败 throw,并清理未 rename 的临时文件。
+ */
+export function atomicWriteRaw(path: string, body: string): { path: string; sha256: string } {
+  const target = resolve(path);
+  const tmp = join(
+    dirname(target),
+    `.${basename(target)}.tmp-${process.pid}-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 10)}`,
+  );
+  let pendingTmp: string | undefined = tmp;
+  try {
+    const fd = openSync(tmp, "wx", 0o644);
+    try {
+      writeSync(fd, body, null, "utf8");
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, target);
+    pendingTmp = undefined;
+    return { path: target, sha256: sha256(body) };
+  } finally {
+    if (pendingTmp !== undefined) {
+      try {
+        unlinkSync(pendingTmp);
+      } catch {
+        /* 临时文件可能未创建成功;忽略 */
+      }
+    }
+  }
 }
 
 /**

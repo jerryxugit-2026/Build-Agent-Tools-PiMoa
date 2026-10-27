@@ -52,6 +52,8 @@ function baseConfig(): Record<string, unknown> {
 			referencePerCallMs: 180000,
 			aggregatorPerCallMs: 480000,
 			moaTotalBackstopMs: 720000,
+			// 2026-09-22 新增（必填、正整数且 < referencePerCallMs）。
+			requestIdleMs: 60000,
 		},
 		defaults: { preset: "default" },
 	};
@@ -68,7 +70,9 @@ function baseModels(): Record<string, unknown> {
 				baseUrl: "http://127.0.0.1:8317/v1",
 				api: "openai-completions",
 				apiKey: "$CLIPROXY_API_KEY",
-				models: [],
+				// ⑦-③（2026-08-03）：preset 引用的 model id 也进交叉校验，故基线须列出
+				// baseConfig 两个 preset 用到的全部 id（否则全部正例被新校验误杀）。
+				models: [{ id: "MiniMax-M3" }, { id: "mimo-v2.5-pro" }, { id: "gpt-5.5" }],
 			},
 		},
 	};
@@ -237,6 +241,80 @@ expectPass("正例A：完整合法配置（default + moa_verify）", baseConfig(
 	expectThrow("⑤-neg2：backstop < ref+agg 串行链", c, "不变量⑤-b");
 }
 
+// ---- 不变量⑤-d 请求级 idle 看门狗阈值（2026-09-22 新增）----
+// 语义：正整数，且必须**严格小于** referencePerCallMs（否则会话级 abort 永远先到，看门狗形同虚设）。
+{
+	const c = clone(baseConfig());
+	(c as any).timeouts.requestIdleMs = 180000; // == referencePerCallMs(180000) ⇒ 不满足"严格小于"
+	expectThrow("⑤-d-neg1：requestIdleMs ≥ referencePerCallMs", c, "不变量⑤-d");
+}
+{
+	const c = clone(baseConfig());
+	(c as any).timeouts.requestIdleMs = 900000; // > referencePerCallMs
+	expectThrow("⑤-d-neg2：requestIdleMs 远大于 referencePerCallMs", c, "不变量⑤-d");
+}
+{
+	const c = clone(baseConfig());
+	(c as any).timeouts.requestIdleMs = -1;
+	expectThrow("⑤-d-neg3：requestIdleMs 非正", c, "必须是正整数");
+}
+{
+	const c = clone(baseConfig());
+	(c as any).timeouts.requestIdleMs = 1500.5;
+	expectThrow("⑤-d-neg4：requestIdleMs 非整数", c, "必须是正整数");
+}
+{
+	// neg6：== undici 默认空闲 body 超时(300_000) ⇒ 看门狗永远不会先到点，必须拒。
+	//   把 referencePerCallMs 抬到 540000，隔离掉"< referencePerCallMs"那条，专测 undici 这条上限。
+	const c = clone(baseConfig());
+	(c as any).timeouts.referencePerCallMs = 540000;
+	(c as any).timeouts.moaTotalBackstopMs = 1350000;
+	(c as any).timeouts.requestIdleMs = 300000;
+	expectThrow("⑤-d-neg6：requestIdleMs = 300000（undici 默认 bodyTimeout）", c, "undici");
+}
+{
+	// neg7：> undici 默认空闲 body 超时 ⇒ 同样拒，且文案要指出 UND_ERR_BODY_TIMEOUT 依据
+	const c = clone(baseConfig());
+	(c as any).timeouts.referencePerCallMs = 540000;
+	(c as any).timeouts.moaTotalBackstopMs = 1350000;
+	(c as any).timeouts.requestIdleMs = 400000;
+	expectThrow("⑤-d-neg7：requestIdleMs 超过 undici 默认 bodyTimeout", c, "UND_ERR_BODY_TIMEOUT");
+}
+{
+	// neg8：看门狗**也**装在聚合器腿上（那条腿的 per_call = aggregatorPerCallMs）⇒ 上界必须取
+	//   min(referencePerCallMs, aggregatorPerCallMs)。这里把 aggregatorPerCallMs 压到 requestIdleMs
+	//   之下：聚合器腿的会话级 abort 会静默架空看门狗，必须拒（主代理 R3 F1 复现的缺口）。
+	const c = clone(baseConfig());
+	(c as any).timeouts.aggregatorPerCallMs = 100000;
+	(c as any).timeouts.requestIdleMs = 120000;
+	expectThrow("⑤-d-neg8：requestIdleMs ≥ aggregatorPerCallMs（聚合器腿看门狗被架空）", c, "aggregatorPerCallMs");
+}
+{
+	// 正例 1：显式给合法值 ⇒ 原样落到 cfg.timeouts.requestIdleMs
+	const c = clone(baseConfig());
+	(c as any).timeouts.requestIdleMs = 60000;
+	const p = writeFixture(c);
+	try {
+		const out = loadConfig({ moaYaml: p });
+		if (out.timeouts.requestIdleMs === 60000) {
+			console.log("✅ PASS  ⑤-d-pos1：requestIdleMs=60000 合法且原样落入 cfg");
+			pass++;
+		} else {
+			console.error(`❌ FAIL  ⑤-d-pos1：requestIdleMs 未被保留（实际 ${String(out.timeouts.requestIdleMs)}）`);
+			fail++;
+		}
+	} catch (err) {
+		console.error(`❌ FAIL  ⑤-d-pos1：期望通过，却抛错\n         → ${err instanceof Error ? err.message : String(err)}`);
+		fail++;
+	}
+}
+{
+	// 负例 5：整键省略 ⇒ fail-loud（与 timeouts 其余三键同口径；不接受隐式缺省）
+	const c = clone(baseConfig());
+	delete (c as any).timeouts.requestIdleMs;
+	expectThrow("⑤-d-neg5：省略 requestIdleMs", c, "timeouts.requestIdleMs");
+}
+
 // ---- 不变量⑥ defaults.preset 必须存在于 presets ----
 {
 	const c = clone(baseConfig());
@@ -271,16 +349,16 @@ function multiProviderConfig(): Record<string, unknown> {
 				aggregator: { provider: "cliproxy", model: "gpt-5.5", profile: "synthesize-worker" },
 			},
 		},
-		timeouts: { referencePerCallMs: 180000, aggregatorPerCallMs: 480000, moaTotalBackstopMs: 720000 },
+		timeouts: { referencePerCallMs: 180000, aggregatorPerCallMs: 480000, moaTotalBackstopMs: 720000, requestIdleMs: 60000 },
 		defaults: { preset: "default" },
 	};
 }
 function multiProviderModels(): Record<string, unknown> {
 	return {
 		providers: {
-			cliproxy: { baseUrl: "http://127.0.0.1:8317/v1", api: "openai-completions", apiKey: "$CLIPROXY_API_KEY", models: [] },
-			minimax: { baseUrl: "https://api.minimaxi.com/anthropic", api: "anthropic-messages", apiKey: "$MINIMAX_API_KEY", models: [] },
-			xiaomi: { baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1", api: "openai-completions", apiKey: "$XIAOMI_API_KEY", models: [] },
+			cliproxy: { baseUrl: "http://127.0.0.1:8317/v1", api: "openai-completions", apiKey: "$CLIPROXY_API_KEY", models: [{ id: "gpt-5.5" }] },
+			minimax: { baseUrl: "https://api.minimaxi.com/anthropic", api: "anthropic-messages", apiKey: "$MINIMAX_API_KEY", models: [{ id: "MiniMax-M3" }] },
+			xiaomi: { baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1", api: "openai-completions", apiKey: "$XIAOMI_API_KEY", models: [{ id: "mimo-v2.5-pro" }] },
 		},
 	};
 }
@@ -310,6 +388,21 @@ expectPassWithModels("⑦-pos：moa.yaml↔models.json 一致（3 provider）", 
 	const models = multiProviderModels();
 	(models as any).providers.cliproxy.apiKey = "sk-plaintext"; // 非 $ENV 引用
 	expectThrowWithModels("⑦-neg3：models.json apiKey 非 $ENV 形式", multiProviderConfig(), writeModels(models), "非 \"$ENV\" 形式");
+}
+
+// ⑦-neg6（③，2026-08-03）：preset 引用的 model id 不在该 provider 的 models[].id → fail-loud。
+//   本缺口的实锤现象：启动期全绿、运行期首次调用 getModel 返回 null → "模型未找到" → 首轮 fail-closed。
+{
+	const models = multiProviderModels();
+	(models as any).providers.minimax.models = [{ id: "MiniMax-M2" }]; // 真源里没有 MiniMax-M3
+	expectThrowWithModels("⑦-neg6：引用的 model id 不在 provider.models", multiProviderConfig(), writeModels(models), "models 中不存在");
+}
+
+// ⑦-neg7（③ 边界）：provider.models 为空数组 → 引用任何 model 都 fail-loud（报"无任何 model"）。
+{
+	const models = multiProviderModels();
+	(models as any).providers.xiaomi.models = [];
+	expectThrowWithModels("⑦-neg7：provider.models 为空数组", multiProviderConfig(), writeModels(models), "无任何 model");
 }
 
 // ⑦-neg4：models.json 读取失败（路径不存在）→ 清晰错误。

@@ -21,6 +21,8 @@ import type { MoaConfig, WorkerRef } from "../src/config/types.js";
 import type { RunSessionImpl } from "../src/moa/orchestrate.js";
 import type { SessionRunResult } from "../src/moa/session.js";
 
+process.env.PIMOA_SPOOL_DIR = mkdtempSync(join(tmpdir(), "pimoa-spool-test-"));
+
 let passed = 0;
 let failed = 0;
 function assert(cond: unknown, msg: string): void {

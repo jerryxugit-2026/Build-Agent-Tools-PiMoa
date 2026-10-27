@@ -11,7 +11,9 @@
  *
  * 相对 pi 内置 read 的差异（均为收紧，不放宽）：
  *  · **纳入会话取证预算**（与 bash_readonly 共用一本账，见 budget.ts）；
- *  · **路径 jail**：复用 bash_readonly 的 `checkPathJail`（realpath 越界 + nlink>1 硬链接检测），
+ *  · **路径 jail**：复用 bash_readonly 的 `checkPathJail`（realpath 越界检测；
+ *    nlink>1 硬链接检测自 2026-07-26 起**默认关闭**——本机 Google Drive 暂存目录使几乎每个文件
+ *    nlink=2，误报率 100%，详见 bash_readonly.ts 中 checkPathJail 的注释），
  *    只允许读审计根（cwd）内的文件 —— 内置 read 无此限制（可读 ~/.ssh 等），故此覆盖亦是安全收紧；
  *  · 不支持图片附件（取证场景不需要；请求图片时明确告知改用 bash_readonly 的 file/stat）。
  * 接口与内置一致：`{ path, offset?, limit? }`，默认截断沿用 pi 的 2000 行 / 50KB。
@@ -23,10 +25,10 @@ import { Type } from "typebox";
 import { checkPathJail } from "./bash_readonly.js";
 import {
   budgetCrossedNotice,
-  budgetExhaustedReason,
-  chargeBudget,
   createRetrievalBudget,
-  isBudgetExhausted,
+  releaseBudget,
+  reserveBudget,
+  settleBudget,
   type RetrievalBudget,
 } from "./budget.js";
 
@@ -39,9 +41,10 @@ interface ReadDetails {
   budgetUsedChars?: number;
 }
 
-/** 与 pi 内置 read 对齐的单次截断上限。 */
-const DEFAULT_MAX_LINES = 2000;
-const DEFAULT_MAX_BYTES = 50 * 1024;
+/** 单次截断上限:统一取证工具口径(limits.ts TOOL_SLICE,v4 §4.3;原 2000 行/50KB)。 */
+import { READ_MAX_LINES, TOOL_SLICE_CHARS } from "../config/limits.js";
+const DEFAULT_MAX_LINES = READ_MAX_LINES;
+const DEFAULT_MAX_BYTES = TOOL_SLICE_CHARS;
 /** 二进制/图片扩展名：取证场景不回传内容。 */
 const NON_TEXT_RE = /\.(jpe?g|png|gif|webp|bmp|ico|pdf|zip|gz|tar|so|dylib|dll|exe|o|a|wasm|mp[34]|mov)$/i;
 
@@ -49,17 +52,23 @@ const NON_TEXT_RE = /\.(jpe?g|png|gif|webp|bmp|ico|pdf|zip|gz|tar|so|dylib|dll|e
  * 预算版 read 的工厂：每个会话建一份，绑定该会话的取证预算账本
  * （与同会话的 bash_readonly **共用同一本账**）。
  */
-export function createReadTool(budget: RetrievalBudget = createRetrievalBudget()) {
+export function createReadTool(
+  budget: RetrievalBudget = createRetrievalBudget(),
+  readRoots: readonly string[] = [],
+) {
   return defineTool({
     name: "read", // ★同名覆盖 pi 内置 read
     label: "Read (budgeted)",
     description:
-      "读取文件内容（限审计目录内的文本文件）。默认最多 2000 行 / 50KB，用 offset/limit 读大文件的指定片段。\n" +
+      "读取文件内容（限审计根内的文本文件；审计根 = 会话 cwd + 服务端配置的跨仓只读根，" +
+      "给绝对路径即可读到其它仓库）。默认最多 2000 行 / 50KB，用 offset/limit 读大文件的指定片段。\n" +
       "★本会话的取证有**总预算**（与 bash_readonly 共用）：超出后读取会被拒绝，请优先用" +
       "`bash_readonly` 的 `rg -n 模式 路径` 只取匹配行、或用 offset/limit 精确读片段，" +
-      "**不要整库整文件地扫**。读不到审计目录之外的文件。",
+      "**不要整库整文件地扫**。读不到审计目录之外的文件。\n" +
+      "★Go 相关任务可按需读共享 skill 指南：`~/.claude/skills/golang-<名称>/SKILL.md`" +
+      "（46 个，路由入口 golang-how-to；一次至多读 1–2 个最对口的，同扣取证预算，勿全量扫）。",
     promptSnippet:
-      "read: 读审计目录内的文本文件（2000 行/50KB 上限，支持 offset/limit）；计入会话取证预算，超预算即拒——优先用 rg 取匹配行而非整文件读",
+      "read: 读审计目录内的文本文件（2000 行/50KB 上限，支持 offset/limit）；计入会话取证预算，超预算即拒——优先用 rg 取匹配行而非整文件读。Go 任务可按需读 ~/.claude/skills/golang-<名称>/SKILL.md（入口 golang-how-to，一次至多 1–2 个）",
     parameters: Type.Object({
       path: Type.String({ description: "要读取的文件路径（相对或绝对，须在审计目录内）" }),
       offset: Type.Optional(Type.Number({ description: "起始行号（1 起）" })),
@@ -74,18 +83,11 @@ export function createReadTool(budget: RetrievalBudget = createRetrievalBudget()
     ) => {
       const cwd = (ctx as { cwd?: string })?.cwd ?? process.cwd();
 
-      // ★预算闸：已超顶即拒绝再读（读盘前就判）。
-      if (isBudgetExhausted(budget)) {
-        const reason = budgetExhaustedReason(budget);
-        return {
-          content: [{ type: "text" as const, text: `REJECTED（取证预算耗尽）：${reason}` }],
-          details: { path: params.path, rejected: true, reason } as ReadDetails,
-          isError: true,
-        };
-      }
-
-      // ★路径 jail：复用 bash_readonly 的越界/硬链接检测（内置 read 没有这层）。
-      const jailReason = checkPathJail(["read", params.path], cwd);
+      // ★路径 jail：复用 bash_readonly 的越界/密钥/硬链接检测（内置 read 没有这层）。
+      //   注意本工具的读发生在 **server 进程内**（readFileSync，不过沙箱），故这层 JS 检查
+      //   是它唯一的防线——密钥清单必须在此生效，不能只靠 SBPL。
+      //   2026-09-06 起 jail/目录/二进制/stat 失败四类"无内容拒绝"都在**预扣之前**判定,不再 reserve→release 绕一圈。
+      const jailReason = checkPathJail(["read", params.path], cwd, { readRoots });
       if (jailReason) {
         return {
           content: [{ type: "text" as const, text: `REJECTED（路径 jail）：${jailReason}` }],
@@ -95,7 +97,7 @@ export function createReadTool(budget: RetrievalBudget = createRetrievalBudget()
       }
 
       const abs = resolve(cwd, params.path);
-      let raw: string;
+      let fileBytes: number;
       try {
         const st = statSync(abs);
         if (st.isDirectory()) {
@@ -117,7 +119,7 @@ export function createReadTool(budget: RetrievalBudget = createRetrievalBudget()
             isError: true,
           };
         }
-        raw = readFileSync(abs, "utf8");
+        fileBytes = st.size;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
@@ -127,39 +129,72 @@ export function createReadTool(budget: RetrievalBudget = createRetrievalBudget()
         };
       }
 
-      // 行切片（offset 1 起）+ 与 pi 内置一致的 2000 行 / 50KB 截断。
-      const allLines = raw.split("\n");
-      const start = Math.max(1, Math.floor(params.offset ?? 1));
-      const maxLines = Math.max(1, Math.floor(params.limit ?? DEFAULT_MAX_LINES));
-      const slice = allLines.slice(start - 1, start - 1 + Math.min(maxLines, DEFAULT_MAX_LINES));
-
-      let text = slice.join("\n");
-      const notices: string[] = [];
-      if (text.length > DEFAULT_MAX_BYTES) {
-        text = text.slice(0, DEFAULT_MAX_BYTES);
-        notices.push(`[已按 ${DEFAULT_MAX_BYTES / 1024}KB 上限截断]`);
+      // ★预算闸——原子预扣（提速方案 §4.2）。
+      //   2026-09-06:预扣量按**文件实际字节数**封顶(UTF-8 字节数 ≥ 码点数,是输出字符的安全上界),不再一律按
+      //   单次上限 120k 预扣——此前 DeepSeek 一条消息并行发两个几 KB 的 read 就把 verify 档 240k 账面锁满,
+      //   第三个 tool call 被拒且账本粘滞标"耗尽"。bash_readonly/devkb/semble/web_fetch 的输出量事前不可知,仍按单次上限预扣。
+      const reserveCap = Math.max(1, Math.min(fileBytes, DEFAULT_MAX_BYTES));
+      const reservation = reserveBudget(budget, reserveCap);
+      if (!reservation.ok) {
+        const reason = reservation.reason;
+        return {
+          content: [{ type: "text" as const, text: `REJECTED（取证预算耗尽）：${reason}` }],
+          details: { path: params.path, rejected: true, reason } as ReadDetails,
+          isError: true,
+        };
       }
-      const lastLine = start - 1 + slice.length;
-      if (lastLine < allLines.length) {
-        notices.push(
-          `[仅显示第 ${start}-${lastLine} 行，共 ${allLines.length} 行；继续读请用 offset=${lastLine + 1}]`,
-        );
+      const ticket = reservation.ticket;
+      try {
+        let raw: string;
+        try {
+          raw = readFileSync(abs, "utf8");
+        } catch (err) {
+          releaseBudget(budget, ticket); // stat 后读失败(竞态删除/权限)：无内容不记账
+          const msg = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: "text" as const, text: `读取失败：${msg}` }],
+            details: { path: params.path, rejected: true, reason: msg } as ReadDetails,
+            isError: true,
+          };
+        }
+
+        // 行切片（offset 1 起）+ 与 pi 内置一致的 2000 行 / 50KB 截断。
+        const allLines = raw.split("\n");
+        const start = Math.max(1, Math.floor(params.offset ?? 1));
+        const maxLines = Math.max(1, Math.floor(params.limit ?? DEFAULT_MAX_LINES));
+        const slice = allLines.slice(start - 1, start - 1 + Math.min(maxLines, DEFAULT_MAX_LINES));
+
+        let text = slice.join("\n");
+        const notices: string[] = [];
+        if (text.length > DEFAULT_MAX_BYTES) {
+          text = text.slice(0, DEFAULT_MAX_BYTES);
+          notices.push(`[已按单次 ${DEFAULT_MAX_BYTES} 字符上限截断]`);
+        }
+        const lastLine = start - 1 + slice.length;
+        if (lastLine < allLines.length) {
+          notices.push(
+            `[仅显示第 ${start}-${lastLine} 行，共 ${allLines.length} 行；继续读请用 offset=${lastLine + 1}]`,
+          );
+        }
+        if (notices.length > 0) text += `\n${notices.join(" ")}`;
+
+        // settle（与 bash_readonly 共用同一本账）：预扣换实际字符；settle 后跨阈值则附加收敛提示。
+        if (settleBudget(budget, ticket, text.length)) text += budgetCrossedNotice(budget);
+
+        return {
+          content: [{ type: "text" as const, text }],
+          details: {
+            path: params.path,
+            rejected: false,
+            lines: `${start}-${lastLine}/${allLines.length}`,
+            budgetUsedChars: budget.usedChars,
+          } as ReadDetails,
+          // ★绝不设 addedToolNames（防孙 agent 不变量）。
+        };
+      } finally {
+        // 抛错兜底：预扣绝不悬挂。已 settle/release 的票据幂等跳过。
+        settleBudget(budget, ticket, 0);
       }
-      if (notices.length > 0) text += `\n${notices.join(" ")}`;
-
-      // 记账（与 bash_readonly 共用同一本账）；跨阈值则附加收敛提示。
-      if (chargeBudget(budget, text.length)) text += budgetCrossedNotice(budget);
-
-      return {
-        content: [{ type: "text" as const, text }],
-        details: {
-          path: params.path,
-          rejected: false,
-          lines: `${start}-${lastLine}/${allLines.length}`,
-          budgetUsedChars: budget.usedChars,
-        } as ReadDetails,
-        // ★绝不设 addedToolNames（防孙 agent 不变量）。
-      };
     },
   });
 }

@@ -1,0 +1,15 @@
+{
+  "id": "fact",
+  "source": "../../../PiMoa/src/moa/jevcheck.ts#FACT_LINK_SPEC:96-97（映射 QUESTIONS.fact:105）",
+  "description": "fact：判定问法模板（noul）。instructions/criteria 逐字取自 source 真源，问法不改字。静态问法：判定材料/命题置于 state；可直接经 jev_judge_with_template 调用。带占位符的未来模板才需消费侧拼装或 A4 槽位替换。",
+  "questions": {
+    "fact": {
+      "type": "noul",
+      "instructions": "这条事实与所给材料（或所述通用规范）相符。",
+      "criteria": {
+        "true": "相符",
+        "false": "不相符：引用位置/内容与代码不一致，或所述通用行为不成立"
+      }
+    }
+  }
+}

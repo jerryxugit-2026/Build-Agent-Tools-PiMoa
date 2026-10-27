@@ -1,12 +1,13 @@
 # Build-Agent-Tools-PiMoa
 
-**Two MCP servers I built because I did not trust AI with my own files.**
-One stops an agent from wrecking a real spreadsheet. The other makes several
+**Three MCP servers I built because I did not trust AI with my own files.**
+One stops an agent from wrecking a real spreadsheet. One makes several
 models argue — blind, with evidence, inside a sandbox — before anything counts.
+The third is a judge that says how sure it is, and is right about that.
 
 Working tools · source and docs in English and 中文 · built and rebuilt across 2025–2026
 
-**English** · [中文](#中文) · [`sheet_shadow`](./sheet_shadow) · [`PiMoa`](./PiMoa)
+**English** · [中文](#中文) · [`sheet_shadow`](./sheet_shadow) · [`PiMoa`](./PiMoa) · [`jev-mcp`](./jev-mcp)
 
 ---
 
@@ -262,6 +263,7 @@ Building the tools and counting their cost are the same job, done honestly.
 | [`sheet_shadow/`](./sheet_shadow) | The Excel safety layer. [README](./sheet_shadow/README.md) (EN + 中文) · [principle diagram](./sheet_shadow/docs/sheet-shadow-principle.svg) |
 | [`sheet_shadow/sheet_shadow_core`](./sheet_shadow/sheet_shadow_core) | The workbook engine (legacy Rust/Python line) |
 | [`sheet_shadow/scripts`](./sheet_shadow/scripts) | Audit and smoke-check tools for high-risk workbooks |
+| [`jev-mcp/`](./jev-mcp) | The calibrated judge (Go). [README](./jev-mcp/README.md) — 212 measured judgments: at ≥ 0.99 stated confidence it is right 96.1 % of the time |
 
 Release snapshots (with full source at each tag) are kept under the earlier
 [`Ai-learning`](https://github.com/jerryxugit-2026/Ai-learning) repository:
@@ -277,6 +279,11 @@ Release snapshots (with full source at each tag) are kept under the earlier
   paying several models to check, not about everyday chat.
 - **Platform reality:** PiMoa's sandbox is macOS (`sandbox-exec`); elsewhere it
   refuses to execute rather than run wide open.
+- **Tests, as they stand on 2026-10-26.** PiMoa: 49 test files; 43 pass out of the box, 8 of those skip
+  unless you point them at the author's private datasets (`PIMOA_WORKSPACE`) or an indexed repository
+  (`PIMOA_DEVKB_ROOT`). **6 fail on my machine too** — mostly tests written against an older protocol
+  version after the server moved to MCP `2026-07-28` only. jev-mcp: one template-anchor test is red
+  for the same reason on both machines. They are listed, not hidden; fixing them is the next batch.
 - **Nothing here is magic.** It is careful plumbing around models that are
   powerful, useful, and wrong in ways that sound confident.
 

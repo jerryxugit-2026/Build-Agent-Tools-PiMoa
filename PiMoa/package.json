@@ -5,14 +5,18 @@
   "type": "module",
   "description": "Pi-MoA dev shell (M0 skeleton: pi SDK + local CLIProxy streaming smoke)",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.19.0"
   },
   "scripts": {
-    "m0": "tsx src/m0-smoke.ts"
+    "m0": "tsx src/m0-smoke.ts",
+    "postinstall": "node bin/apply-pi-patches.mjs apply"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.81.1",
+    "@earendil-works/pi-coding-agent": "0.99.2",
+    "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/node": "2.1.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/server": "2.2.0",
     "typebox": "^1.1.38",
     "yaml": "^2.9.0",
     "zod": "^4.4.3"

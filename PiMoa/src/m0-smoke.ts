@@ -20,7 +20,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = resolve(__dirname, "..");
 
 const PROVIDER = process.env.M0_PROVIDER ?? "cliproxy";
-const MODEL_ID = process.env.M0_MODEL ?? "gpt-5.5";
+// 2026-08-16：随 models.json 的 gpt-5.5 → gpt-5.6-luna 换代同步。
+// ⚠️ 本默认值与 config/models.json 的条目 id 硬耦合，改名模型时必须同步改这里，
+//    否则 m0 冒烟直接 "模型未找到" 挂掉（2026-08-16 实际踩到）。
+const MODEL_ID = process.env.M0_MODEL ?? "gpt-5.6-luna";
 const PROMPT = process.env.M0_PROMPT ?? "用一句话解释万有引力";
 const TIMEOUT_MS = Number(process.env.M0_TIMEOUT_MS ?? 120000);
 

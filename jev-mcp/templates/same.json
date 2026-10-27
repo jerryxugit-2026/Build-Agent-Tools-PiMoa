@@ -1,0 +1,15 @@
+{
+  "id": "same",
+  "source": "../../../PiMoa/src/moa/jevcheck.ts#QUESTIONS.same:118-121",
+  "description": "same：判定问法模板（noul）。instructions/criteria 逐字取自 source 真源，问法不改字。静态问法：判定材料/命题置于 state；可直接经 jev_judge_with_template 调用。带占位符的未来模板才需消费侧拼装或 A4 槽位替换。",
+  "questions": {
+    "same": {
+      "type": "noul",
+      "instructions": "下面两条代码审查发现（finding A 与 finding B）指向的是同一个问题。",
+      "criteria": {
+        "true": "两条指向同一个问题：描述的是代码中同一处缺陷，只是措辞不同，应当合并去重",
+        "false": "两条指向不同问题：描述的是代码中两处互相独立的缺陷，不应合并"
+      }
+    }
+  }
+}

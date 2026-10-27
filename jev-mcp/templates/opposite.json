@@ -1,0 +1,15 @@
+{
+  "id": "opposite",
+  "source": "../../../PiMoa/src/moa/jevcheck.ts#QUESTIONS.opposite:125-126",
+  "description": "opposite：判定问法模板（noul）。instructions/criteria 逐字取自 source 真源，问法不改字。静态问法：判定材料/命题置于 state；可直接经 jev_judge_with_template 调用。带占位符的未来模板才需消费侧拼装或 A4 槽位替换。",
+  "questions": {
+    "opposite": {
+      "type": "noul",
+      "instructions": "两条发现针对同一处代码得出了相反或明显不一致的结论（一方认为有缺陷/更严重，另一方认为不成立/更轻）。",
+      "criteria": {
+        "true": "相反或不一致",
+        "false": "一致或只是措辞不同"
+      }
+    }
+  }
+}

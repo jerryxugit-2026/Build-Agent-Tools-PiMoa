@@ -28,6 +28,7 @@
 import { accessSync, constants, existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { sbplSecretDenyLines } from "./access.js";
 
 /** 原生沙箱可执行文件（macOS）。 */
 export const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
@@ -110,12 +111,23 @@ function sbplString(s: string): string {
 }
 
 /**
- * 生成 SBPL profile：默认拒绝（继承 bsd.sb）+ 允许 exec/fork + 读白名单（系统只读 + target + scratch）
- * + 显式屏蔽 $HOME 与 /etc + 写白名单（仅 scratch 与 /dev/null）。
- * 排列讲究「后者覆盖」（last-match-wins）：先 deny $HOME，再 allow target/scratch ——
- * 即便 target 落在 $HOME 之下，也因 allow 在后而可读，而 $HOME 其余（含 ~/.ssh）仍被拒。
+ * 生成 SBPL profile：默认拒绝（继承 bsd.sb）+ 允许 exec/fork + 读白名单（系统只读 + target
+ * + 配置的额外只读根 + scratch）+ 显式屏蔽 $HOME 与 /etc + 密钥文件拒读 + 写白名单（仅 scratch 与 /dev/null）。
+ *
+ * 排列讲究「后者覆盖」（last-match-wins），故顺序是：
+ *   系统只读 allow → deny $HOME/etc → allow target+extraRoots+scratch → **deny 密钥清单**（最后，必须赢）。
+ *
+ * ★extraReadRoots（2026-08-04 跨仓核查）：来自 moa.yaml 的 access.readRoots（服务端配置真源，
+ *   调用方与 agent 都改不了）。加进读白名单后，`rg 某跨仓目录/` 这类**目录级递归**才读得到——
+ *   argv 级的 checkPathJail 管不了递归读，内核这层才是真闸。
+ * ★密钥 deny 放最后：读根一放大，工作区内各项目的 .env / auth.json / *.pem / model_registry.yaml
+ *   就都进了可读面；这几行 deny 是唯一能挡住「rg 递归读进密钥文件」的机制（见 tools/access.ts）。
  */
-export function buildSandboxProfile(targetDir: string, scratchDir: string): string {
+export function buildSandboxProfile(
+  targetDir: string,
+  scratchDir: string,
+  extraReadRoots: readonly string[] = [],
+): string {
   const target = realpathOrSelf(targetDir);
   const scratch = realpathOrSelf(scratchDir);
   const home = process.env.HOME ? realpathOrSelf(process.env.HOME) : "";
@@ -133,7 +145,13 @@ export function buildSandboxProfile(targetDir: string, scratchDir: string): stri
   if (home) lines.push(`(deny file-read* (subpath ${sbplString(home)}))`);
   lines.push('(deny file-read* (subpath "/private/etc") (literal "/etc"))');
   // 读白名单（放在 deny 之后 ⇒ target/scratch 即便在 $HOME 下也可读）。
-  lines.push(`(allow file-read* (subpath ${sbplString(target)}) (subpath ${sbplString(scratch)}))`);
+  const readSubpaths = [target, ...extraReadRoots.map(realpathOrSelf), scratch]
+    .filter((p, i, arr) => arr.indexOf(p) === i)
+    .map((p) => `(subpath ${sbplString(p)})`)
+    .join(" ");
+  lines.push(`(allow file-read* ${readSubpaths})`);
+  // ★密钥文件拒读——必须在全部 allow 之后（last-match-wins）。与 JS 侧路径 jail 同源于 access.ts。
+  lines.push(...sbplSecretDenyLines());
   // 写白名单：仅 scratch 与 /dev/null。
   lines.push(`(allow file-write* (subpath ${sbplString(scratch)}) (literal "/dev/null"))`);
   return lines.join("\n");
@@ -188,6 +206,7 @@ export interface SandboxBuildError {
 export function buildSandboxedInvocation(
   argv: string[],
   cwd: string,
+  extraReadRoots: readonly string[] = [],
 ): SandboxedInvocation | SandboxBuildError {
   if (!isSandboxAvailable()) {
     return {
@@ -213,7 +232,7 @@ export function buildSandboxedInvocation(
     }
   };
 
-  const profile = buildSandboxProfile(cwd, scratch);
+  const profile = buildSandboxProfile(cwd, scratch, extraReadRoots);
   const env = buildSandboxEnv(scratch);
   return {
     file: SANDBOX_EXEC,

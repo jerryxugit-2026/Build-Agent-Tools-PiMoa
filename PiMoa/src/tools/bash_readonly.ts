@@ -16,20 +16,23 @@
  * registerTool 注入派生工具的机会；工具结果**从不设 addedToolNames**（不向会话引入任何新工具），
  * execute 只 execFile 只读命令（无 spawn agent CLI、无写、无 MCP）。详见汇报。
  */
+import { TOOL_SLICE_CHARS } from "../config/limits.js";
 import { execFile } from "node:child_process";
 import { readFileSync, realpathSync, statSync } from "node:fs";
-import { resolve, sep } from "node:path";
+import { resolve } from "node:path";
 import { defineTool, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { analyzeCommand } from "./bash_readonly_policy.js";
+import { PAPER_SYSTEM_ROOT } from "./devkb_search.js";
+import { effectiveReadRoots, isWithinRoots, secretDenyReason } from "./access.js";
 import { buildSandboxedInvocation, expandTildeForCheck } from "./sandbox.js";
 import {
   budgetCrossedNotice,
-  budgetExhaustedReason,
-  chargeBudget,
+  budgetMaxChars,
   createRetrievalBudget,
-  isBudgetExhausted,
-  SESSION_OUTPUT_CHAR_BUDGET,
+  releaseBudget,
+  reserveBudget,
+  settleBudget,
   type RetrievalBudget,
 } from "./budget.js";
 
@@ -44,12 +47,13 @@ export {
 /** 单次执行硬上限：防大输出 / 挂起。 */
 const EXEC_TIMEOUT_MS = 15_000;
 const MAX_BUFFER_BYTES = 4 * 1024 * 1024; // 4 MiB
-const MAX_OUTPUT_CHARS = 60_000; // 回传给模型前截断，省 token
+const MAX_OUTPUT_CHARS = TOOL_SLICE_CHARS; // 统一单次取证输出上限(limits.ts,v4 §4.3;原 60_000)
 
 interface ExecOutcome {
   code: number | null;
   stdout: string;
   stderr: string;
+  aborted?: boolean;
   spawnError?: string;
 }
 
@@ -64,8 +68,9 @@ function runArgv(
   argv: string[],
   cwd: string,
   signal: AbortSignal | undefined,
+  readRoots: readonly string[] = [],
 ): Promise<ExecOutcome> {
-  const built = buildSandboxedInvocation(argv, cwd);
+  const built = buildSandboxedInvocation(argv, cwd, readRoots);
   if ("error" in built) {
     return Promise.resolve({ code: null, stdout: "", stderr: "", spawnError: built.error });
   }
@@ -103,7 +108,9 @@ function runArgv(
             : err
               ? null
               : 0;
-        resolvePromise({ code, stdout: out, stderr: errout });
+        // abort（signal 触发，code='ABORT_ERR'）单独打标：别让中止伪装成"(无输出)"
+        const aborted = (err as { code?: unknown } | null)?.code === "ABORT_ERR";
+        resolvePromise({ code, stdout: out, stderr: errout, ...(aborted ? { aborted: true } : {}) });
       },
     );
   });
@@ -112,10 +119,31 @@ function runArgv(
 /**
  * ★路径 jail（审计 🟠#7 / 任务 C）——沙箱之外的**第二道**，两项检查：
  *
- * (A) **硬链接读逃逸**（对抗审实证残余，一招清零）：`realpath` 不解析硬链接，沙箱按**路径**放行——
- *     故 cwd 内一个硬链接指向 cwd 外/`$HOME` 下**同卷**秘密文件时，`cat hardlink` 能读出秘密并经
- *     stdout 进 proposal 外泄。对**每个将被读取的路径参数（含裸文件名，如 `cat hl_secret` 的 `hl_secret`）**
- *     做 `statSync`，若「常规文件且 `nlink > 1`」即拒。正常源码仓库文件 nlink 恒为 1，误伤面极小。
+ * (A) **硬链接读逃逸**（★2026-07-26 起**默认关闭**，须显式 `{hardlinkGuard:true}` 才启用）：
+ *     `realpath` 不解析硬链接，沙箱按**路径**放行——故 cwd 内一个硬链接指向 cwd 外/`$HOME` 下**同卷**
+ *     秘密文件时，`cat hardlink` 能读出秘密并经 stdout 进 proposal 外泄。对**每个将被读取的路径参数
+ *     （含裸文件名，如 `cat hl_secret` 的 `hl_secret`）** 做 `statSync`，若「常规文件且 `nlink > 1`」即拒。
+ *
+ *     ⚠️ **为何改为默认关（徐总 2026-07-26 定）**：原注释称「正常源码仓库文件 nlink 恒为 1，误伤面极小」，
+ *     此前提在本机**不成立**。实测本卷（<volume>，APFS）：
+ *       · Paper System 54,276 个、PiMoa 3,417 个常规文件 nlink=2——go.mod / package.json / DESIGN.md 无一幸免；
+ *       · 同卷新建文件 nlink=1 ⇒ 非文件系统假象，是真实的第二条链接；
+ *       · 全卷 inode 追踪定位到它：`<workspace>/workspace/.tmp.driveupload/<id>`
+ *         ——**Google Drive 桌面版的上传暂存目录**（卷顶层的 GoogleSyncFolder/ 佐证）。
+ *     即本机 `nlink>1` 的真实含义是「Google Drive 同步过此文件」，与逃逸无关。
+ *     后果：本检查在此环境**误报率 100%**，proposer 经 read_budgeted / bash_readonly **读不到任何文件**
+ *     （实证：两个 proposer 全程无法读取；聚合器改用目录级 `rg` 绕开后正常取证）。
+ *
+ *     ⚠️ **关闭的代价（如实记录，勿粉饰）**：test/bash_readonly_sandbox.test.ts 有可工作的 PoC，
+ *     证明关闭后 `cat <cwd 内指向 cwd 外的硬链接>` 确实能读出秘密。接受该风险的依据：
+ *       ① 子 agent 严格只读——ALLOWED_COMMANDS 无 `ln`、沙箱禁写，**它自己造不出这种硬链接**；
+ *       ② PiMoa 仅在本机单用户环境运行，能预先埋链接者已具备远超此路径的权限；
+ *       ③ 误伤代价是工具完全不可用，收益是防一个本环境不成立的威胁。
+ *
+ *     ⚠️ **另一个既有缺口（开关与否都存在）**：本检查仅对 `st.isFile()` 生效（目录 nlink 天然 ≥2，
+ *     不加此判断会误伤全部目录参数），因此**任何目录级递归读取都能穿透**——`rg 模式 某目录/` 的参数是
+ *     目录 → (A) 跳过 → ripgrep 递归读入目录内每个文件（含 nlink>1 的）。故 (A) 从来只挡
+ *     「直接以文件为参数」这一种用法，不是完整防线。
  *
  * (B) **越界逃逸**：对**每个非 flag 位置参数**（含裸文件名，与 (A) nlink 检测同覆盖面）做 realpath
  *     解析，要求落在审计根内（target=cwd 及其子树）；越界（绝对路径逃逸 / `..` 穿越 / symlink 逃逸，
@@ -125,28 +153,44 @@ function runArgv(
  * flag（`-` 前缀）与解析后落在 root 内/不存在的参数不因此拒（交给命令自身处理），避免误拒取证用法。
  * 返回 null=通过；否则返回拒绝原因。
  */
-export function checkPathJail(argv: string[], cwd: string): string | null {
-  let root: string;
-  try {
-    root = realpathSync(cwd);
-  } catch {
-    root = resolve(cwd);
-  }
-  const withinRoot = (p: string): boolean => p === root || p.startsWith(root + sep);
+/** checkPathJail 选项。`hardlinkGuard` 默认 **false**（见上方 (A) 的长注释）。 */
+export interface PathJailOptions {
+  /** 启用 (A) 硬链接读逃逸检测。默认 false——本机 Google Drive 暂存链接导致 100% 误报。 */
+  hardlinkGuard?: boolean;
+  /**
+   * ★额外只读根（2026-08-04 跨仓核查）：来自 moa.yaml 的 `access.readRoots`（服务端配置真源）。
+   * cwd 恒为根之一；不传即退化成改造前的**单根**行为，逐字节等价。
+   * **绝不接受调用方入参或 agent 自调**——扩权决定权只在配置里。
+   */
+  readRoots?: readonly string[];
+}
+
+export function checkPathJail(
+  argv: string[],
+  cwd: string,
+  opts: PathJailOptions = {},
+): string | null {
+  const hardlinkGuard = opts.hardlinkGuard === true; // 默认关：缺省/未传一律不启用
+  // 根集合 = 会话 cwd ∪ 配置读根（均已 canonical）。不配 readRoots ⇒ 只有 cwd（旧行为）。
+  const roots = effectiveReadRoots(cwd, opts.readRoots ?? []);
+  const root = roots[0] as string; // cwd 根，仅用于拒绝理由里的人读提示
+  const withinRoot = (p: string): boolean => isWithinRoots(p, roots);
   for (const token of argv.slice(1)) {
     // flag 不是读取目标：跳过（flag 的写/执行面已由 analyzeCommand 逐条 denylist 兜住）。
     if (token.startsWith("-")) continue;
     const candidate = expandTildeForCheck(token);
     const abs = resolve(cwd, candidate);
 
-    // (A) 硬链接读逃逸检测——**覆盖裸文件名**（realpath 不解硬链接，(B) 越界检测挡不住同卷硬链接）。
-    try {
-      const st = statSync(abs); // 跟随 symlink：判的是真正会被读到的那个 inode。
-      if (st.isFile() && st.nlink > 1) {
-        return `[bash_readonly] 拒绝：'${token}' 是硬链接（nlink=${st.nlink}），可能逃逸读取沙箱外文件`;
+    // (A) 硬链接读逃逸检测——默认关闭；开启后覆盖裸文件名（realpath 不解硬链接，(B) 挡不住同卷硬链接）。
+    if (hardlinkGuard) {
+      try {
+        const st = statSync(abs); // 跟随 symlink：判的是真正会被读到的那个 inode。
+        if (st.isFile() && st.nlink > 1) {
+          return `[bash_readonly] 拒绝：'${token}' 是硬链接（nlink=${st.nlink}），可能逃逸读取沙箱外文件`;
+        }
+      } catch {
+        /* 不存在/非路径参数：可能是 grep 模式、revision 等，交给命令自身处理 */
       }
-    } catch {
-      /* 不存在/非路径参数：可能是 grep 模式、revision 等，交给命令自身处理 */
     }
 
     // (B) 越界逃逸检测：覆盖**所有**非 flag token（含裸名，与 (A) 同覆盖面，杜绝裸名 symlink 元数据侧信道）。
@@ -173,7 +217,18 @@ export function checkPathJail(argv: string[], cwd: string): string | null {
     //   旧实现 `!withinRoot(real) && !withinRoot(abs)` 因 abs 不解 symlink 恒在 cwd 内 → symlink 越界漏判。
     //   合法场景（cwd 前缀含 symlink）不误拒：canonical root vs canonical real 比较即正确。
     if (!withinRoot(real)) {
-      return `路径参数 '${token}' 越出审计根 ${root}（禁读 target 之外，如 /etc/passwd、~/.ssh、config/auth.json）`;
+      return (
+        `路径参数 '${token}' 越出审计根（禁读根之外，如 /etc/passwd、~/.ssh）。` +
+        `当前允许的只读根：${roots.join(" | ")}（第一个是会话 cwd=${root}，其余来自 moa.yaml 的 access.readRoots）`
+      );
+    }
+
+    // (C) ★密钥文件拒读（2026-08-04）：读根放大到整个工作区后，各项目的 .env / auth.json /
+    //     *.pem / model_registry.yaml 都落进了可读面。此处按文件名减面（沙箱侧有同源的内核级 deny，
+    //     两侧同源于 tools/access.ts）。判的是 realpath 结果 ⇒ 经 symlink 指向密钥文件同样被拒。
+    const secret = secretDenyReason(real);
+    if (secret) {
+      return `路径参数 '${token}' 被拒：${secret}`;
     }
   }
   return null;
@@ -219,10 +274,44 @@ function clip(s: string): string {
  * 供工具本体与（潜在的）编排层复用的运行入口：analyze → 拒/执行。
  * 绝不抛：拒绝与执行失败都折成结构化结果。
  */
+/**
+ * rg / ast-grep 的搜索根里落在 Paper System 内的那些（canonical 路径比较，带分隔符前缀防「Paper System-x」误伤）。
+ * 路径参数 = argv 里能解析成现存路径的 token（跳过 argv[0]）；一个都没有时搜索根就是 cwd。
+ * 非检索命令返回空数组。
+ */
+export function paperSystemSearchRoots(argv: readonly string[], cwd: string): string[] {
+  if (argv[0] !== "rg" && argv[0] !== "ast-grep") return [];
+  const candidates: string[] = [];
+  for (const tok of argv.slice(1)) {
+    if (tok.startsWith("-")) continue;
+    const abs = resolve(cwd, tok);
+    try {
+      statSync(abs);
+      candidates.push(abs);
+    } catch {
+      /* 不是现存路径（模式串 / 子命令 / glob）*/
+    }
+  }
+  if (candidates.length === 0) candidates.push(resolve(cwd));
+  const sep = "/";
+  const hits: string[] = [];
+  for (const c of candidates) {
+    let real = c;
+    try {
+      real = realpathSync(c);
+    } catch {
+      /* 保持原样 */
+    }
+    if (real === PAPER_SYSTEM_ROOT || real.startsWith(PAPER_SYSTEM_ROOT + sep)) hits.push(c);
+  }
+  return hits;
+}
+
 export async function runBashReadonly(
   command: string,
   cwd: string,
   signal?: AbortSignal,
+  readRoots: readonly string[] = [],
 ): Promise<{ rejected: boolean; reason?: string; text: string }> {
   const verdict = analyzeCommand(command);
   if (!verdict.allowed) {
@@ -232,14 +321,24 @@ export async function runBashReadonly(
       text: `REJECTED（只读闸拦截）：${verdict.reason}\n命令：${command}`,
     };
   }
-  // 路径 jail（沙箱外第二道）：任一路径参数逃出审计根即拒（不执行）。
-  const jailReason = checkPathJail(verdict.argv, cwd);
+  // 路径 jail（沙箱外第二道）：任一路径参数逃出审计根、或命中密钥清单即拒（不执行）。
+  const jailReason = checkPathJail(verdict.argv, cwd, { readRoots });
   if (jailReason) {
     return {
       rejected: true,
       reason: jailReason,
       text: `REJECTED（路径 jail）：${jailReason}\n命令：${command}`,
     };
+  }
+  // 检索分流铁律（徐总 2026-08-12 / 09-20 灰度第 3 轮重申）：Paper System 仓库的检索一律走 devkb_search，
+  // 禁止对它做全文扫库。rg / ast-grep 的搜索根（路径参数，缺省 cwd）落在 Paper System 内即拒并指路；
+  // 精确读文件（cat / rtk read / read 工具）不受影响。与 semble_search.ts 的执法同口径。
+  const searchRoots = paperSystemSearchRoots(verdict.argv, cwd);
+  if (searchRoots.length > 0) {
+    const reason =
+      `检索分流铁律：Paper System 仓库（${PAPER_SYSTEM_ROOT}）的检索一律走 devkb_search（语义+全文+调用图），` +
+      `不要用 ${verdict.argv[0]} 扫库（命中根：${searchRoots.join(" | ")}）。先 devkb_search 定位到路径与行号，再用 read / rtk read 精确读。`;
+    return { rejected: true, reason, text: `REJECTED（检索分流）：${reason}\n命令：${command}` };
   }
   // ast-grep 专属：审计根 sgconfig 动态库加载 jail（对抗审 #8，命令行不引用配置故 checkPathJail 覆盖不到）。
   if (verdict.argv[0] === "ast-grep") {
@@ -252,9 +351,12 @@ export async function runBashReadonly(
       };
     }
   }
-  const r = await runArgv(verdict.argv, cwd, signal);
+  const r = await runArgv(verdict.argv, cwd, signal, readRoots);
   if (r.spawnError) {
     return { rejected: false, text: `执行错误：${r.spawnError}` };
+  }
+  if (r.aborted) {
+    return { rejected: false, text: "执行已中止（会话取消）" };
   }
   const parts: string[] = [];
   if (r.stdout) parts.push(clip(r.stdout));
@@ -270,13 +372,18 @@ export async function runBashReadonly(
  * 预算与 `read` 工具**共用同一本账**（见 src/tools/budget.ts）。
  * 不传 budget ⇒ 建一个新的（等价于该实例独占预算）。
  */
-export function createBashReadonlyTool(budget: RetrievalBudget = createRetrievalBudget()) {
+export function createBashReadonlyTool(
+  budget: RetrievalBudget = createRetrievalBudget(),
+  readRoots: readonly string[] = [],
+) {
   return defineTool({
   name: "bash_readonly",
   label: "Bash (read-only)",
   description:
     "在**OS 级沙箱内**运行一条**只读取证** bash 命令并返回 stdout（沙箱：无网络、写限临时目录、" +
-    "读限审计目标、env 无密钥；输出封顶 6 万字符，超了会明确提示截断）。\n" +
+    `读限审计根、env 无密钥；输出封顶 ${MAX_OUTPUT_CHARS} 字符（=TOOL_SLICE_CHARS），超了会明确提示截断）。\n` +
+    "★可读范围 = 会话 cwd + 服务端配置的**跨仓只读根**：给绝对路径即可读到其它仓库（跨仓核查用），" +
+    "越界路径与密钥类文件（.env / auth.json / *.pem / *.key / model_registry.yaml / .ssh 等）一律拒。\n" +
     "★检索三件套（各司其职，别混用）：\n" +
     "  · 找文本/正则/找文件 → `rg`（如 `rg -n 模式 路径`、`rg --files -g '*.ts'`）；\n" +
     "  · 找代码结构（某种函数/调用/写法，忽略注释与字符串）→ `ast-grep run -p '模式' -l ts 路径`" +
@@ -287,7 +394,7 @@ export function createBashReadonlyTool(budget: RetrievalBudget = createRetrieval
     "写重定向(>/>>)、管道写、bash -c/eval/sudo/xargs、命令替换 $()/``、;/&&/|| 串接、越界路径、" +
     "rtk 的执行类子命令（docker/test/err…）、ast-grep 的写/rewrite 全拒。禁止用它修改被审对象。",
   promptSnippet:
-    "bash_readonly: 沙箱内只读取证（搜文本用 rg / 搜结构用 ast-grep / 紧凑读用 rtk read / git diff/hash/stat；无网络·写限 scratch·路径 jail；grep/find 已下线，写/执行/串接一律拒）",
+    "bash_readonly: 沙箱内只读取证（★已知符号名/字面量/正则的精确定位用 rg；搜结构用 ast-grep；紧凑读用 rtk read；git diff/hash/stat；不知道代码在哪时先用 semble_search/devkb_search 语义定位；无网络·写限 scratch·路径 jail；grep/find 已下线，写/执行/串接一律拒）",
   parameters: Type.Object({
     command: Type.String({
       description:
@@ -301,9 +408,12 @@ export function createBashReadonlyTool(budget: RetrievalBudget = createRetrieval
     _onUpdate: unknown,
     ctx: ExtensionContext,
   ) => {
-    // ★会话级预算闸：已超顶即拒绝再检索（在执行**之前**判，省掉无谓的沙箱开销）。
-    if (isBudgetExhausted(budget)) {
-      const reason = budgetExhaustedReason(budget);
+    // ★会话级预算闸——原子预扣（提速方案 §4.2）：**同步** reserve 单次上限后才 await 执行，
+    //   同一条消息里并行的其它工具调用在各自 reserve 时即看到在途额度，超额的在此被拒（不进沙箱）。
+    //   旧的「检查 → await → 记账」在 pi 并行执行下 N 个调用全在 usedChars=0 时过闸，已废除。
+    const reservation = reserveBudget(budget, MAX_OUTPUT_CHARS);
+    if (!reservation.ok) {
+      const reason = reservation.reason;
       return {
         content: [{ type: "text" as const, text: `REJECTED（取证预算耗尽）：${reason}` }],
         details: {
@@ -311,20 +421,29 @@ export function createBashReadonlyTool(budget: RetrievalBudget = createRetrieval
           rejected: true,
           reason,
           budgetUsedChars: budget.usedChars,
-          budgetLimitChars: SESSION_OUTPUT_CHAR_BUDGET,
+          budgetLimitChars: budgetMaxChars(budget),
         },
         isError: true,
       };
     }
+    const ticket = reservation.ticket;
 
     const cwd = (ctx as { cwd?: string })?.cwd ?? process.cwd();
-    const res = await runBashReadonly(params.command, cwd, signal);
-
-    // 记账（被策略/jail 拒的调用不产出内容，不计入预算）。
-    let text = res.text;
-    if (!res.rejected) {
-      // 跨过阈值：本次结果照常返回，但**附加**收敛提示（下一次调用会被上面的闸拒）。
-      if (chargeBudget(budget, text.length)) text += budgetCrossedNotice(budget);
+    let res: Awaited<ReturnType<typeof runBashReadonly>>;
+    let text: string;
+    try {
+      res = await runBashReadonly(params.command, cwd, signal, readRoots);
+      text = res.text;
+      if (res.rejected) {
+        // 被策略/jail 拒的调用不产出内容，不计入预算：退还预扣与轮数（与改造前"不记账"口径一致）。
+        releaseBudget(budget, ticket);
+      } else if (settleBudget(budget, ticket, text.length)) {
+        // settle 后跨过阈值：本次结果照常返回，但**附加**收敛提示（下一次调用会在 reserve 阶段被拒）。
+        text += budgetCrossedNotice(budget);
+      }
+    } finally {
+      // 抛错兜底：预扣绝不悬挂（悬挂 = 后续永久少一片额度）。已 settle/release 的票据幂等跳过。
+      settleBudget(budget, ticket, 0);
     }
 
     return {
@@ -334,7 +453,7 @@ export function createBashReadonlyTool(budget: RetrievalBudget = createRetrieval
         rejected: res.rejected,
         ...(res.reason ? { reason: res.reason } : {}),
         budgetUsedChars: budget.usedChars,
-        budgetLimitChars: SESSION_OUTPUT_CHAR_BUDGET,
+        budgetLimitChars: budgetMaxChars(budget),
       },
       ...(res.rejected ? { isError: true } : {}),
       // ★绝不设 addedToolNames：本工具不向会话引入任何新工具（防孙 agent）。

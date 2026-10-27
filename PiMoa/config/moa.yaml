@@ -4,7 +4,38 @@
 # key 名与 src/config/types.ts（钉死契约）一一对应（camelCase）。
 #
 # 端点分散（徐总 2026-07-24）：不把三模型都压在 CLIProxy 上（依赖过强+它有 SOCKS 抖动）。
-#   gpt-5.5 走本地 CLIProxy；minimax / xiaomi 直连各自官方 endpoint。全程零 OpenRouter。
+#
+# ★proposer1 模型选型（2026-07-25 徐总定）：gemini-3.6-flash-high → gemini-3.5-flash。
+#   CLIProxy 内部是**两条互斥专线**，由模型名硬绑定（徐总物理隔离实测：单开一条通道时，
+#   另一条的模型直接 502 unknown provider）：
+#     · vertex 专线（4 个 GCP service-account）：gemini-3.5-flash / gemini-2.5-flash …
+#     · OAuth/antigravity 专线（10+ 个个人 Google 账号轮询）：gemini-3.6-* / gemini-3-flash-agent …
+#   OAuth 专线实测存在后端分叉（同一 prompt 同一 model id，8 次采样 5 次返思维轨迹、
+#   in_tokens 在 47~1383 间跳、耗时 5.4-15.6s）；vertex 专线 6/6 稳定、in 恒 46、12.0-15.2s。
+#   → 2026-07-26 再换 deepseek-v4-pro（直连 api.deepseek.com，**完全不经 CLIProxy**）：
+#     vertex 专线虽无路由分叉，但 CLIProxy 出站走 Mullvad SOCKS5，该隧道对**空闲连接**
+#     有约 64s 超时。非流式长生成期间连接是空闲的，故 TTFB 超 64s 即被掐（PaperGo 侧
+#     实测失败率 78%，7 次失败耗时 62.5-65.3s、极差仅 2.8s）。
+#     判决性实证：对 aiplatform.googleapis.com 空闲 80s——经 SOCKS5 断、直连活；空闲 45s 两者皆活。
+#     直连 provider 不经该隧道，从根上避开。
+#
+# ★aggregator 选型（2026-07-26 徐总定）：deepseek-v4-pro → claude-opus-4-8，与 PaperGo MoA 对齐。
+#   起因：07-26 把 proposer1 换成 deepseek-v4-pro 后，proposer1 与 aggregator 同模型（2/3 跳），
+#   交叉验证强度下降。三跳三模型原则不变。
+#   ★2026-08-27 徐总定：claude-opus-4-8 → claude-opus-5（与 PaperGo agg=claude-opus-5-agg
+#     的真名 claude-opus-5 对齐；8317 在册实测）。
+#   ★2026-09-20 徐总定：claude-opus-5 → gpt-5.6-terra（**把 Claude 从 PiMoa 移除**）。两个 preset 的
+#     主聚合器一并换掉，备胎维持 gpt-5.6-luna（见下方 presets）。随之作废的是原「跨厂上游隔离」口径：
+#     此前写的是「claude-opus-5→Anthropic，gpt-5.6-luna→OpenAI，单边容量事件能被这条兜住」，
+#     现主备同族（gpt-5.6-terra / gpt-5.6-luna）、同经本机 CLIProxy ⇒ 不再有跨厂隔离，这一跳只兜
+#     「单一模型 id 被上游拒/冷却」，兜不住整厂容量事件。这是本次更换明知的代价，据此登记。
+#   ⚠️ 通道代价仍在：聚合器挂回 CLIProxy → Mullvad SOCKS5 那条路径。可接受的依据是**通道差异**——
+#     该隧道的 ~60s 计时器只在**两向皆无数据待传**时累积；聚合器上游字节持续流动，故不触发
+#     （PaperGo 聚合器同路径实测 88-194s 全成），而非流式 vertex 调用生成期零字节，2/3 撞墙。
+#   端点分散仍成立：三跳只有聚合器一跳在 CLIProxy，两个 proposer 均直连。
+#   gpt-5.6-terra / gpt-5.6-luna 走本地 CLIProxy（luna 2026-08-16 由 gpt-5.5 换代）；minimax / xiaomi 直连各自官方 endpoint。全程零 OpenRouter。
+#
+# ★proposer1 模型选型（2026-08-02 徐总定）：deepseek-v4-pro → deepseek-v4-flash。
 
 # 供给方 endpoint（与模型解耦，改 endpoint 不动 preset）。
 # api_key 走 env 引用，绝不落配置明文。
@@ -25,17 +56,112 @@ providers:
     kind: openai # api.deepseek.com = OpenAI 兼容（另有 /anthropic 端点，此处用 openai）
     baseUrl: "https://api.deepseek.com"
     apiKeyEnv: DEEPSEEK_API_KEY
+  # ★2026-10-19 徐总 D-18：新增 openai / anthropic 两个订阅 OAuth provider（去 8317 cliproxy 直连）。
+  #   两者均不写 apiKeyEnv —— OAuth 凭据落 config/auth.json（由徐总本人登录产生），models.json 条目亦不写 apiKey；
+  #   加载期不变量④ 对未定义 apiKeyEnv 的 provider 自动跳过（src/config/load.ts:508-517）。
+  #   ⚠️ 本块 baseUrl/kind 运行期完全不生效（真源 = config/models.json + config/auth.json，
+  #   src/config/load.ts:683-692）；baseUrl 仅为过 parseProvider 的 requireString（src/config/load.ts:107）。
+  openai: # ChatGPT 订阅 OAuth 直连（pi-ai builtin provider id "openai"，api=openai-responses）
+    kind: openai
+    baseUrl: "https://api.openai.com/v1"
+  anthropic: # Claude 订阅 OAuth 直连（pi-ai builtin provider id "anthropic"，api=anthropic-messages）
+    kind: anthropic
+    baseUrl: "https://api.anthropic.com"
 
 # 命名 preset（可自由增删多套组合，无需改代码）。
+#
+# ★2026-10-01 徐总裁定 DEC-52（模型使用规则，随 pi 0.99.2 窗口生效）：
+#   ① cliproxy/claude-opus-4-7 **不再用于 PiMoa**（任何角色）；
+#   ② cliproxy/glm-5.3 **不得作聚合器**（aggregator / aggregatorFallback）；
+#   ③ xiaomi/mimo-* **不得作 PiMoa proposer**。
+#   以上同样约束调用时的 `models` / `aggregator` 覆盖入参（见 PiMoa_Codex使用说明.md 对应节）。
+#   依据 PM-MATRIX（<workspace>/artifacts/pi-upgrade-eval-20261001/pm-matrix/REPORT.md）：
+#     opus-4-7 大材料 540s 中止（既有事故 #1，矩阵 4/12 次尝试超时、两版同形态）；
+#     glm-5.3 作聚合器中位 172s，约为 opus-5-5 / sol（29s）的 6 倍（始终思考、不可关）；
+#     MiMo 两款结构化清单格式遵循度低（22 次尝试 4 次因业务 REJECT 连续 3 次失败）。
+#   据此两个 preset：proposer1 claude-opus-4-7 → cliproxy/gpt-5.6-luna；aggregatorFallback gpt-5.6-luna →
+#   cliproxy/gpt-5.6-sol（避免 proposer 与备胎聚合器同模型；sol 在 PM-MATRIX 作聚合器 15 格 0 失败、中位 29s）；
+#   主聚合器 claude-opus-5-5 与 proposer2 deepseek-flash 不变。超时段（timeouts.*）与模型无关，不动；
+#   加载期不变量①（provider 已注册）②（verify 备胎只读 profile）对新组合照常成立。
+# ★2026-10-01 徐总裁定 DEC-78：两个 preset 改为 proposer cliproxy/gpt-6.1-sol + cliproxy/claude-opus-4-8 →
+#   aggregator cliproxy/claude-opus-5-5（不变），aggregatorFallback cliproxy/gpt-5.6-sol（不变）。依据：
+#   <workspace>/artifacts/pi-upgrade-eval-20261001/opus48-eval-20261001T200535Z/REPORT-luna.md（luna 偏浅）、
+#   REPORT.md（opus-4-8 替代 flash）、REPORT-preset.md（本组合同轮隔离实测 5/5、大材料 223–261s）。
+#   ⚠️ 已知代价照实：三跳全走本机 CLIProxy 8317（端点分散丢失，8317 故障即整轮失败）；proposer2 与聚合器
+#     同属 Claude 族（交叉独立性下降）；超时段 timeouts.* 不变。
+#   ⚠️ 落盘纪律：本文件与 config/models.json（新增 gpt-6.1-sol / claude-opus-4-8 条目）必须同批原子落盘、同批回滚——
+#     只落本文件时 8758 启动即被 loadConfig 不变量③（src/config/load.ts:757-805）以「moa.yaml↔models.json 漂移」拒启。
+# ★2026-10-04 徐总令：proposer1 cliproxy/gpt-6.1-sol → cliproxy/gpt-5.6-terra；aggregatorFallback
+#   cliproxy/gpt-5.6-sol → cliproxy/gpt-5.6-terra（两个 preset 同改）。主聚合器 claude-opus-5-5 与
+#   proposer2 claude-opus-4-8 不变，timeouts.* / quorum 不动。
+#   ⚠️【决议演进，须留档】本条**特批打破 DEC-52 的「避免 proposer 与备胎聚合器同模型」**（见上方 DEC-52 注
+#     第 71-72 行，该约束是 2026-10-01 为「luna 任 proposer1 + sol 任备胎」那套组合定的）。现 proposer1 与
+#     aggregatorFallback 同为 gpt-5.6-terra ⇒ **仅在主聚合器限流/故障降级触发备胎时**才会出现同模型聚合
+#     （受控的临时降级态，非常态）；常态下聚合器仍是 claude-opus-5-5，与两个 proposer 均异构。
+#     ⛔ 后续维护者注意：看到上方 DEC-52「避免同模型」不要把本条「改回去」——那是本条已裁决的取舍。
+#   ⚠️【换角动机，必须留档】-sol 档（gpt-5.6-sol / gpt-6-sol / gpt-6.1-sol）对 free ChatGPT 账号一律
+#     400「The 'X' model is not supported when using Codex with a ChatGPT account.」。2026-10-04 A/B 实测
+#     坐实：同一 free 账号对 gpt-5.6-luna / gpt-5.6-terra / gpt-6-luna 均 200 且真出内容，唯 -sol 三款全 400
+#     （闸门在上游账号套餐，CLIProxy 侧 oauth-model-alias 注释着、无本地白名单可绕）。
+#     CLIProxy codex 池实测 11 个凭据：9 个 plan_type=free、2 个付费（prolite / team）
+#     （2026-10-04 逐个枚举 ~/.cli-proxy-api/codex-*.json 计数得出）⇒ -sol 候选池实为 2 个付费账号。
+#     ⚠️ 两个付费账号当日并非都不可用，勿读成「双双阵亡」：team 已撞 usage_limit_reached 2 次
+#     （plan_type:team、limit_window_minutes=10080）；prolite 当日 -sol 两款均 200 正常，仅 1 次非限流的
+#     HTML 上游错误页。真实风险是**二者同时耗尽或故障时备胎即无可用凭据**——因为 free 那 9 个对 -sol 一律 400。
+#     换 terra 后候选池扩回 11，专治「主聚合器限流 → 换备胎 → 备胎落到 free 账号 → free 不支持 -sol → 空正文」
+#     这条失效链（即 AGENTS.md 记录的「stage=aggregator 正文为空 = 备胎产出空正文」成因）。
+#   ⚠️ 落盘纪律闭环：gpt-5.6-terra 已于 2026-09-20 在 config/models.json 在册（reasoning:false、
+#     contextWindow=922000、maxTokens=65535），本次**只改本文件**、不动 models.json ⇒ 不变量③
+#     （moa.yaml↔models.json 漂移）不触发；日后回退同样只改本文件，不必连带 models.json。
+#   ⚠️ 生效与回滚：改本文件须**重启 8758** 才生效。改动前物理备份 =
+#     <workspace>/workspace/Claude dev paper system/PiMoa/config/moa.yaml.bak-moa-terra-20261004
+#     （cp -p 后 cmp 逐字节核对过，sha256 前16位 0a00a1e471198e55）；
+#     回滚 = 用该备份覆盖本文件后重启 8758。
+# ★2026-10-09 徐总最新纠正裁决（原「离线草稿，尚未激活」为历史状态；现已受控激活）：两个 preset default / moa_verify 同改。
+#   proposer2：cliproxy/claude-opus-4-8 → cliproxy/gpt-5.6-sol；
+#   主 aggregator：cliproxy/claude-opus-5-5 → cliproxy/gpt-6.1-sol。
+#   主代理原任务书将两个 GPT 的角色写反，属于主代理错误；本段按最新纠正消息与同步任务书执行。
+#   proposer1 与 aggregatorFallback 仍为 cliproxy/gpt-5.6-terra；profile / quorum / timeouts /
+#   http.mode / budget / jevcheck 及其他有效字段全保持，不配置 effort / thinking；历史注释原样留档。
+#   两 GPT 已在 <workspace>/workspace/Claude dev paper system/PiMoa/config/models.json 在册：
+#   reasoning:false、contextWindow=922000、maxTokens=65535；本单不改 registry，真实 loadConfig 仍须通过。
+#   ⚠️ 已知取舍：四个角色同属 GPT 家族，多模型交叉的独立性下降；同走本机 CLIProxy 8317，
+#   无跨厂 / 跨通道隔离；备胎仅兜单一模型 id 拒绝或冷却，无法覆盖通道及全家族容量故障。
+#   ⚠️ 既有 sol 风险保留：2026-10-04 实测 free ChatGPT 账号不支持 sol，只有符合资格的账号子池
+#   可用；子池耗尽 / 冷却 / 路由落到 free 时可能 400 / 空正文。注册与离线加载不证明实时路由。
+#   状态追记：Tx 已受控激活，default / moa_verify 原生 smoke 均核验 gpt-5.6-terra + gpt-5.6-sol → gpt-6.1-sol（仅证明当次默认接线）；本次仅校正注释，不启停服务。
 presets:
   # default = synthesize：2 proposer → aggregator，2/2 quorum，聚合正文即最终答案。
   default:
     mode: synthesize
     quorum: all # 全成才放行；否则 fail-closed
     proposers:
-      - { provider: cliproxy, model: gemini-3.6-flash-high, profile: synthesize-worker }
-      - { provider: minimax, model: MiniMax-M3, profile: synthesize-worker }
-    aggregator: { provider: deepseek, model: deepseek-v4-pro, profile: synthesize-worker }
+      # ★2026-09-27 徐总裁定（矩阵实测换角）：proposer1 → cliproxy/claude-opus-4-7。依据
+      #   artifacts/papergo-hooks-tune-20260926 两轮矩阵（v1 persist.go 用例 + v2 assembly.go 全新用例）：
+      #   Opus 4.7/4.8 中大超大 6/6 结构合规、输出克制（1.5-2.5K tok）、15-46s；Sonnet 5 因冗余话痨
+      #   撞 maxTokens 截断退化被否。09-24 的 glm-5.3-flash 被换角（慢热脆点：71.9s、structured 3 次才过）。
+      # ★2026-10-01 徐总裁定 DEC-52：proposer1 claude-opus-4-7 → cliproxy/gpt-5.6-luna（依据见 presets 段首）。
+      # ★2026-10-01 徐总裁定 DEC-78：proposer1 gpt-5.6-luna → cliproxy/gpt-6.1-sol（luna 偏浅，依据见 presets 段首 DEC-78 注）。
+      - { provider: openai, model: gpt-5.6-terra, profile: synthesize-worker }   # ★2026-10-04 徐总令：proposer1 gpt-6.1-sol → gpt-5.6-terra；★2026-10-19 徐总 D-18：provider cliproxy→openai（ChatGPT 订阅 OAuth 直连）
+      # ★2026-09-27 徐总裁定：proposer2 保留 DeepSeek-V4.1-Flash（canonical id = deepseek-flash，
+      #   09-24 定型件，v1 矩阵基线实测快稳：15.5s、2 次过 structured）。与 proposer1 双厂独立。
+      #   原 zhipu/glm-5.3-flash 换角沿革见上条；MiniMax-M3 等备选仍留 models.json 作回退。
+      # ★2026-10-01 徐总裁定 DEC-78：proposer2 deepseek-flash → cliproxy/claude-opus-4-8（INC-DSF-1 flash 上游降级；DEC-52 只禁 opus-4-7，不含 4-8）。
+      - { provider: anthropic, model: claude-opus-5-5, profile: synthesize-worker }   # ★2026-10-19 徐总 D-18：proposer2 cliproxy/gpt-5.6-sol → anthropic/claude-opus-5-5（Claude 订阅 OAuth 直连）
+    # ★2026-09-27 徐总裁定：聚合器 → cliproxy/claude-opus-5-5。依据同日聚合器矩阵（短样×4、
+    #   长输入×2、超长输出 9K tok、v2 全矩阵）：8/8 稳、JSON 完整、抓假材料能力实证、10-13s。
+    #   沿革：gpt-5.6-terra →(09-24) zhipu/glm-5.3（11/11 实证）→(09-26 ZLM 限流应急 luna)→(09-27) claude-opus-5-5。
+    #   ★effort/thinking 有意不配置（徐总「不需要就不填」；cliproxy anthropic 通道 reasoning_effort 形态未探，
+    #   跑模型默认档；若聚合质量不足再探 thinking:{enabled,budget_tokens}）。
+    aggregator: { provider: openai, model: gpt-6-sol, profile: synthesize-worker }   # ★2026-10-19 徐总 D-18：aggregator cliproxy/gpt-6.1-sol → openai/gpt-6-sol（是 gpt-6-sol，不是 gpt-6.1-sol）
+    # ★聚合器降级备胎（2026-08-18 徐总定）。主聚合器报错/空正文/无 agent_end 时换它重跑一次；
+    #   超时与取消不触发（见 src/config/types.ts Preset.aggregatorFallback）。
+    #   2026-09-27 徐总裁定维持 gpt-5.6-luna 不变。⚠️ 已知局限照实：新主 claude-opus-5-5 与备胎同走
+    #   CLIProxy 8317 通道（09-24 注释里「跨通道隔离」因本次换角再次丢失），本跳只兜「单一模型 id
+    #   被上游拒/冷却」这一层；通道级故障主备同挂。
+    # ★2026-10-01 徐总裁定 DEC-52：备胎 gpt-5.6-luna → cliproxy/gpt-5.6-sol（luna 改任 proposer1，避免同模型；
+    #   主备同走 8317 的通道局限照旧）。
+    aggregatorFallback: { provider: openai, model: gpt-5.6-terra, profile: synthesize-worker }   # ★2026-10-04 徐总令：备胎 gpt-5.6-sol → gpt-5.6-terra；★2026-10-19 徐总 D-18：provider cliproxy→openai（与 proposer1 同模型同 provider，沿 2026-10-04 terra/terra 特批取舍）
 
   # moa_verify = verify（只读）：★聚合器也必须只读，profile 限 verify-worker /
   # delivery-readonly-worker（否则聚合器可写、只读被击穿，闭合审核🔴#1）。
@@ -43,17 +169,132 @@ presets:
     mode: verify
     quorum: all
     proposers:
-      - { provider: cliproxy, model: gemini-3.6-flash-high, profile: verify-worker }
-      - { provider: minimax, model: MiniMax-M3, profile: verify-worker }
-    aggregator: { provider: deepseek, model: deepseek-v4-pro, profile: verify-worker }
+      # ★2026-09-27 徐总裁定（同 default preset 矩阵实测）：proposer1 → cliproxy/claude-opus-4-7。
+      # ★2026-10-01 徐总裁定 DEC-52：proposer1 claude-opus-4-7 → cliproxy/gpt-5.6-luna（同 default 段）。
+      # ★2026-10-01 徐总裁定 DEC-78：proposer1 gpt-5.6-luna → cliproxy/gpt-6.1-sol（luna 偏浅，依据见 presets 段首 DEC-78 注）。
+      - { provider: openai, model: gpt-5.6-terra, profile: verify-worker }   # ★2026-10-04 徐总令：proposer1 gpt-6.1-sol → gpt-5.6-terra；★2026-10-19 徐总 D-18：provider cliproxy→openai（ChatGPT 订阅 OAuth 直连）
+      # ★2026-09-27 徐总裁定：proposer2 保留 DeepSeek-V4.1-Flash（同 default preset）。
+      #   原 glm-5.3-flash 换角沿革（09-24 A/B 定标入替 mimo-v2.5-pro，09-27 因慢热脆点换出）见 default 段。
+      # ★2026-10-01 徐总裁定 DEC-78：proposer2 deepseek-flash → cliproxy/claude-opus-4-8（INC-DSF-1 flash 上游降级；DEC-52 只禁 opus-4-7，不含 4-8）。
+      - { provider: anthropic, model: claude-opus-5-5, profile: verify-worker }   # ★2026-10-19 徐总 D-18：proposer2 cliproxy/gpt-5.6-sol → anthropic/claude-opus-5-5（Claude 订阅 OAuth 直连）
+    # ★2026-09-27 徐总裁定（同 default preset）：聚合器 → cliproxy/claude-opus-5-5，effort 有意不配。
+    aggregator: { provider: openai, model: gpt-6-sol, profile: verify-worker }   # ★2026-10-19 徐总 D-18：aggregator cliproxy/gpt-6.1-sol → openai/gpt-6-sol（是 gpt-6-sol，不是 gpt-6.1-sol）
+    # 备胎同样必须是只读 profile —— 否则 verify 的只读边界多一个后门（加载期不变量② 已强校验）。
+    #   2026-09-27 徐总裁定维持 gpt-5.6-luna（同 default 段：主备同走 8317，同通道局限照实）。
+    # ★2026-10-01 徐总裁定 DEC-52：备胎 gpt-5.6-luna → cliproxy/gpt-5.6-sol（同 default 段），profile 仍为只读 verify-worker。
+    aggregatorFallback: { provider: openai, model: gpt-5.6-terra, profile: verify-worker }   # ★2026-10-04 徐总令：备胎 gpt-5.6-sol → gpt-5.6-terra；★2026-10-19 徐总 D-18：provider cliproxy→openai（与 proposer1 同模型同 provider，沿 2026-10-04 terra/terra 特批取舍）
 
 # 超时三嵌套（port PaperGo checkTimeoutInvariants，加载期强校验）：
 #   moaTotalBackstopMs ≥ aggregatorPerCallMs 且 ≥ referencePerCallMs；
 #   moaTotalBackstopMs ≥ max(referencePerCallMs) + aggregatorPerCallMs（并行取 max 再串 aggregator）。
 timeouts:
   referencePerCallMs: 540000 # 每个 proposer 的 per_call（2026-07-24 从 360000 上调 +50%：重推理 proposer 实测 177s 逼近旧顶）
-  aggregatorPerCallMs: 720000 # 聚合器更宽：吃 N 份 proposal + 长输出（从 480000 上调 +50%：实测 278s）
-  moaTotalBackstopMs: 1350000 # MoA 总硬 backstop，覆盖整条串行链（从 900000 上调 +50%；仍满足 ≥ max(ref)+agg=1260000 且 ≤ 30min 绝对上限）
+  aggregatorPerCallMs: 620000 # 聚合器更宽：吃 N 份 proposal + 长输出（实测 278s，余量 2.2×）。★2026-09-22 波4 Q2 裁决（甲-620）：720000→620000，给 jevcheck.budget.maxMs 90s→180s 让出 ⑤-b 空间；ref/queue/客户端 1410s 契约三不动。
+  moaTotalBackstopMs: 1350000 # MoA 总硬 backstop，覆盖整条串行链（从 900000 上调 +50%；仍满足 ≥ max(ref)+agg=1160000 且 ≤ 30min 绝对上限；波4 后 ⑤-b=540000+180000+620000=1340000 ≤ 1350000 ✓，⑧=45000+1350000=1395000 < 1410000 ✓）
+  # ★请求级 idle 看门狗（2026-09-22 新增）。加载期不变量 ⑤-d 三条上界，全都要满足：
+  #   ① 正整数；
+  #   ② **低于全部会装看门狗的腿的 per_call**（proposer 腿 = referencePerCallMs，aggregator 腿 =
+  #      aggregatorPerCallMs ⇒ 取两者小者）。看门狗在 orchestrate.ts 两处 runSession 调用上都装，
+  #      配成 `aggregatorPerCallMs < requestIdleMs < referencePerCallMs` 时聚合器腿的看门狗会被
+  #      会话级 abort 静默架空，故必须按取小者校（主代理 R3 F1 已用真 loadConfig 复现该缺口）；
+  #   ③ **低于 300000**（Node undici 默认空闲 body 超时）。
+  #   起因（生产实测）：referencePerCallMs 是**整会话**预算，而一个 proposer 会话含最多 6 次工具
+  #   调用往返；任何一次流式请求卡住（HTTP 已发出、长时间不出任何 token）就把整个 540s 吃光并终结
+  #   会话。2026-09-22 当天 53 轮里 7 轮 proposer 超时，**全部**是 xiaomi/mimo-v2.5-pro、且**全部
+  #   精确卡在 540.0s**；失败轮 output 只有 471/652 token ⇒ 形态是"发出去后没人回"，不是"生成太长"
+  #   （同端点单发 TTFT 8.8s / 42.3 tok/s、5 路并发 ~44s、8 轮抗压 0 断流 ⇒ 间歇性单请求卡顿）。
+  #   语义：距上一次收到流事件（以及请求开始）超过本值仍无事件 ⇒ 以**可重试**错误收尾（errorMessage
+  #   含 "timeout"，稳定命中 pi isRetryableAssistantError 的可重试分支；不撞配额/溢出任何不可重试词），
+  #   由 pi 在**同一会话预算内**自动重试该请求；真卡顿代价从 540s 降到约 180s + 退避。
+  #   取 180000：高于实测健康 p100（70.9k token 提示 TTFT 107.6s）留 ~1.7× 余量，又远低于 540000。
+  #   ⚠️ 上限不是"随便配"：不变量 ⑤-d 要求 < 300000 —— 因为 **Node undici 的默认空闲 body 超时就是
+  #   300_000ms**（2026-09-22 主代理实测：本地卡死流 301.2s 抛 UND_ERR_BODY_TIMEOUT，message 含
+  #   "terminated"，而该词恰好命中 pi 的可重试正则）。若把本键配到 ≥ 300000，undici 会先掐断、
+  #   本看门狗**永远不会先到点** ⇒ 等于把修复静默退回改造前的隐式 300s 行为，加载期还会放行；
+  #   故 ⑤-d 对它 fail-loud（本单的全部价值就是把放弃时机从隐式 300s 提前到显式可配值）。
+  #   ⚠️ 改动本键需重启 8758 才生效（与 jevcheck.* 同）。
+  requestIdleMs: 180000
 
 defaults:
   preset: default
+
+# 读访问策略（徐总 2026-08-04）——**只管读，不碰写**。
+#
+# 起因：PiMoa 此前是单根的，路径 jail / 沙箱读白名单 / semble 搜索根都拿"会话 cwd"当唯一审计根，
+#   于是**跨仓核查做不到**（要同时看 PaperGo 与 System/paper-system 的规格文档时，只看得见一棵树）。
+#
+# 为什么不是简单地把调用时的 cwd 抬到公共祖先：`cwd` 在 moa_deliver 里**同时是写盘的受信任根**
+#   （mcp/server.ts: allowedRoots = del.cwd），抬 cwd 会把**写**权限一起放大 —— 那是安全倒退。
+#   故读根独立配在这里，写根仍旧只有调用方传的 cwd。
+#
+# 谁能改：只有本文件。**不接受工具入参、也绝不给 agent 自调的"加目录"工具**
+#   （pi-add-dir 那种 `add_directory` 等于让被审对象自己发通行证，本项目明确不采用）。
+#
+# 配套（放开读根的连带风险，见 src/tools/access.ts）：读面一放大，工作区内各项目的密钥文件
+#   （.env / auth.json / *.pem / *.key / model_registry.yaml / .ssh 等）就都进了可读面，
+#   故同时在两侧执法拒读：JS 路径 jail（server 进程内直读的唯一防线）+ 沙箱 SBPL deny
+#   （挡 `rg 某目录/` 这种目录级递归读，只有内核这层拦得住）。两侧模式同源，不会漂移。
+#   ⚠️ 诚实标注：这是按**文件名**减面，改名/复制过的密钥挡不住；真正的密钥保护仍是
+#   ①沙箱 env 从零构建（子进程拿不到任何 *_API_KEY）②沙箱无网络（读到也发不出去）。
+#
+# 加载期强校验（fail-loud，不变量⑦）：必须绝对路径、必须存在且是目录、归一到 realpath、
+#   且**不得覆盖 $HOME 或 "/"**（否则 ~/.ssh、~/.aws、~/.claude.json 全进可读面）。
+access:
+  readRoots: []
+    # add absolute directories the verify sandbox may read, e.g. your workspace root
+    # 共享 skill 库（徐总 2026-08-12 定）：与 Claude/Codex 共用同一套 SKILL.md（46 个 Go skill 等），
+    # verify 侧 worker 经 read 工具按需读、同扣取证预算。只放开这个子目录、不触碰 $HOME 禁令；
+    # 目录内容为纯文档（无密钥类文件名），密钥名 denylist 照常生效。
+    # - <your-home>/.claude/skills
+
+# Jev 辅助代码审查（详细设计 v4 §6，2026-09-20；仅 moa_verify）。
+#   enabled=false（灰度前缺省关）：不跑核对、不贴核对表、不注入任何新工具与新段，与旧版逐字节一致。
+#   budget.maxMs 只在 enabled 时计入不变量⑤-b：referencePerCallMs + maxMs + aggregatorPerCallMs ≤ moaTotalBackstopMs
+#   （波4 2026-09-22 Q2 裁决后：540000 + 180000 + 620000 = 1340000 ≤ 1350000 成立；timeouts.requestIdleMs 不动、backstop 不抬）。
+#   premiseRound 的时间账（perCallMs × ceil(maxFindings/concurrency) ≤ budget.maxMs）**无条件**校验
+#   （与 enabled 开关无关）：30000 × ceil(10/10)=1 = 30000 ≤ 180000，现值满足。
+#   缺省值与 src/config/load.ts JEVCHECK_DEFAULTS 一一对应；越界值加载期 fail-loud（并发 ≤ 8、阈值 0..1、次数/毫秒正整数、sampling 各项 1..5）。
+jevcheck:
+  enabled: true                 # 2026-09-20 徐总定灰度第一步：只开总闸（软档、补前提关）；关=不跑核对、不贴核对表、不注入任何新工具与新段（与旧版逐字节一致）
+  url: "http://127.0.0.1:8760/mcp"
+  concurrency: 8
+  perCallTimeoutMs: 15000
+  # ★2026-10-01 窗口 DEC-74 / O3（台账 r92 DEC-72 ④、r97 DEC-75）：auto → modern，与 GO4 modern-only jev 同窗切换；回滚改回 auto。
+  clientMode: modern            # 官方 @modelcontextprotocol/client 2.0 协议代：auto=先探 modern（server/discover）再回落 legacy；modern=钉死 2026-07-28 不回落；legacy=只走 initialize。非法值加载期 fail-loud
+  budget: { maxCalls: 2500, maxMs: 180000, tableMaxChars: 40000 }   # 波4 Q2：maxMs 90000→180000（实测 p50 54.7s / p90 顶格 90s，链步 ×2 采样必然超；⑤-b 由 agg 让出 100s 后闭合）
+  thresholds: { fact: { high: 0.8, low: 0.2 }, same: { merge: 0.8, flag: 0.4 }, conflict: { sameMin: 0.6, oppositeMin: 0.6 }, entail: { low: 0.5 }, refute: 0.1, weak: 0.2 }   # refute/weak = B4 真伪阈值（设计 §5；refute 只喂 KILL，weak=弱证伪/中带）
+  premiseRound: { enabled: true, maxFindings: 10, concurrency: 10, perCallMs: 30000 } # 2026-09-20 徐总定灰度一并打开；一波并行：30000 × ceil(10/10) = 30000 ≤ budget.maxMs 180000
+  fixPresent: { enabled: false } # 只进回执，证据未验，先省调用
+  factRefDirect: { enabled: true }
+  gapList: { enabled: true }
+  gapCarryForward: { enabled: true } # 批12：最近 5 轮材料型缺口最多 10 条提示；缺省关，不改当前 proposer prompt
+  quote: { enabled: true, required: false }
+  stateExpansion: { enabled: false }
+  factThicken: { enabled: true }
+  grayEnrich: { enabled: true }
+  category: { enabled: true }
+  chainEvidenceGate: { enabled: true }
+  categoryAutoRoute: { enabled: true } # Requires category.enabled=true.
+  odTyped: { enabled: false } # Requires category.enabled=true; await real-finding validation.
+  entailBridge: { enabled: true }
+  sampling:   { fact: 2, entail: 2, same: 1, opposite: 1, fixed: 2, link: 2 } # 各问法采样次数（1..5）。波4 裁决：fact 1→2（设计附录 A「fact/link 2 次，KILL 需双样一致」胜旧 fact:1）；link=2 链步双采样（设计 §5）
+  submit:   { required: true, maxAttempts: 3 }   # 2026-09-20 徐总定：proposer 硬门一并打开（无合格清单=该 proposer 失败，quorum=all 下整轮 failed）
+  # 2026-09-20 徐总定：verdicts.required false → true（聚合器硬门，与 PIMOA-DEF-02 的判据修正 1a 配套，
+  #   两者缺一不可）。本键是 src/moa/orchestrate.ts judgeAgg 里既有的聚合器硬门开关
+  #   （`config.jevcheck.verdicts.required`），打开后聚合轮的
+  #   「成功 ⇔ 裁决被 submit_verdicts 接受」；1a 单独做只治「裁决已接受 + 自由正文为空」被误判失败，
+  #   1b 单独做只治「裁决 3 次被拒 + 自由正文非空」被判成功放行残片——2026-09-20 实测轮 moa#e1c484fa
+  #   正是后者（3 次被拒，仅凭 1417 字符散文放行）。两半都堵上才闭合 DEF-02。
+  verdicts: { required: true, maxAttempts: 5, reasonMaxChars: 150 }
+  # ---- C1 / finding 真伪判定设计 §5（波4，2026-09-22）----
+  chain:  { enabled: true, minSteps: 2, maxSteps: 6 }   # B1 chain 灰度开关：false ⇒ 与现行为逐字节等价（不采链步/不算 truth/prompt 不加 chain 项）
+  mech:   { enabled: true, scopePad: 20, minTokenLen: 3 }   # B3 机械佐证层（只在证伪方向使用、永不背书；scopePad/minTokenLen 与 mech.ts 常量同值，暂未参数化——登记）
+
+# ★2026-10-01 窗口 DEC-74 / O3（台账 r92 DEC-72 ④、r97 DEC-75）：8758 HTTP 入口只认 MCP 2026-07-28（reject 形态）。
+#   取值 hybrid（缺省，O2 现网形态）| modern；本段只认 mode 一个键，非法值/未知键/非对象加载期 fail-loud（src/config/load.ts parseHttp）。
+#   modern：legacy 会话腿不挂，2025 系列请求一律由 v2 handler 回 -32022；启动日志须见 `[pi-moa-mcp] http mode=modern`。
+#   回滚：删掉本段或改 mode: hybrid，并把 jevcheck.clientMode 改回 auto，重启 8758。
+#   ⚠️ 落盘纪律（DEC-78 + 本窗口）：本文件与 config/models.json 必须同批原子落盘、同批回滚——只落本文件时 loadConfig
+#     不变量③（moa.yaml↔models.json 漂移）拒启；回滚时两份一起还原到窗口前版本（moa.yaml 5e8ac01a… / models.json a4b29907…）。
+http:
+  mode: modern

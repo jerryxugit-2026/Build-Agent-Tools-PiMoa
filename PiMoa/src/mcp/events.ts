@@ -36,6 +36,19 @@ export type StageEvent =
       stage: "aggregator";
       phase: "started" | "done";
       model: string;
+    }
+  | {
+      stage: "jevcheck";
+      /**
+       * started=jevcheck 阶段起步；done=核对表已产出（含 enabled:false 的空跑）；
+       * skipped=未启用 / 无材料或 findings / Jev 不可用（三者都不算失败，只是没跑）。
+       * （Jev 辅助代码审查详细设计 v4 §3.4 第 6 点 / §3.5 runJevCheck，2026-09-20）
+       */
+      phase: "started" | "done" | "skipped";
+      /** phase="done" 时的核验调用总数（对应 JevCheckReport.totals.calls）。 */
+      calls?: number;
+      /** phase="done" 时的耗时（ms）。 */
+      ms?: number;
     };
 
 /** MCP 通知级别（对齐 pi-mcp：正常 info，失败/超时 warning）。 */
@@ -67,6 +80,14 @@ export function stageEventToNotification(e: StageEvent): {
     }
     case "aggregator": {
       data = `[moa] aggregator ${e.model} ${e.phase}`;
+      break;
+    }
+    case "jevcheck": {
+      if (e.phase === "skipped") level = "info"; // 未启用/无材料属正常路径，不是告警
+      data =
+        e.phase === "done"
+          ? `[moa] jevcheck done calls=${e.calls ?? 0} ms=${e.ms ?? 0}`
+          : `[moa] jevcheck ${e.phase}`;
       break;
     }
   }

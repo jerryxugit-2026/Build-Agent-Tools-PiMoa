@@ -1,0 +1,15 @@
+{
+  "id": "fixed",
+  "source": "../../../PiMoa/src/moa/jevcheck.ts#QUESTIONS.fixed:109-110",
+  "description": "fixed：判定问法模板（noul）。instructions/criteria 逐字取自 source 真源，问法不改字。静态问法：判定材料/命题置于 state；可直接经 jev_judge_with_template 调用。带占位符的未来模板才需消费侧拼装或 A4 槽位替换。",
+  "questions": {
+    "fixed": {
+      "type": "noul",
+      "instructions": "所给代码已经包含「待核对的处理」所述的那种处理。",
+      "criteria": {
+        "true": "已包含：代码中已有等价的处理",
+        "false": "未包含：代码中没有这种处理，或处理不等价"
+      }
+    }
+  }
+}

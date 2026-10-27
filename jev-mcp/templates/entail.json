@@ -1,0 +1,15 @@
+{
+  "id": "entail",
+  "source": "../../../PiMoa/src/moa/jevcheck.ts#QUESTIONS.entail:114-116",
+  "description": "entail：判定问法模板（noul）。instructions/criteria 逐字取自 source 真源，问法不改字。静态问法：判定材料/命题置于 state；可直接经 jev_judge_with_template 调用。带占位符的未来模板才需消费侧拼装或 A4 槽位替换。",
+  "questions": {
+    "entail": {
+      "type": "noul",
+      "instructions": "仅凭上述前提即可推出「待判断的结论」（前提足以推出结论，没有缺失的必要条件，也没有与前提相反）。",
+      "criteria": {
+        "true": "可以推出",
+        "false": "不能推出：缺少必要条件、结论与前提相反、或结论超出前提所述"
+      }
+    }
+  }
+}

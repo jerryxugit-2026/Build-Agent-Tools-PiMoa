@@ -7,7 +7,7 @@ import { existsSync, linkSync, mkdtempSync, mkdirSync, rmSync, statSync, symlink
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { analyzeCommand } from "../src/tools/bash_readonly_policy.ts";
-import { runBashReadonly } from "../src/tools/bash_readonly.ts";
+import { checkPathJail, runBashReadonly } from "../src/tools/bash_readonly.ts";
 import { buildSandboxedInvocation, isSandboxAvailable } from "../src/tools/sandbox.ts";
 
 let pass = 0;
@@ -117,7 +117,14 @@ console.log("── 路径 jail（越出审计根即拒；沙箱外第二道）�
   rmSync(base, { recursive: true, force: true });
 }
 
-console.log("── 硬链接读逃逸（nlink 检测；覆盖裸文件名，对抗审残余清零）──");
+// ★2026-07-26 语义变更（徐总定）：hardlinkGuard 默认**关闭**。
+//   原因：本机 <volume> 上 Google Drive 的 .tmp.driveupload 暂存目录给几乎每个文件都留了第二条
+//   硬链接（Paper System 54,276 个、PiMoa 3,417 个 nlink=2），该检测误报率 100%，
+//   proposer 因此读不到任何文件。详见 src/tools/bash_readonly.ts 中 checkPathJail 的长注释。
+//   本块因此拆成两层：
+//     (甲) 工具默认路径 —— 如实断言「不再拦截」，把接受的风险写在测试里，不粉饰；
+//     (乙) 显式开启 guard —— 保留原 PoC 覆盖，证明该防御本身仍然有效、随时可恢复。
+console.log("── 硬链接读逃逸（guard 默认关：甲=默认放行 / 乙=显式开启仍拦截）──");
 {
   const base = mkdtempSync(join(tmpdir(), "pimoa-hltest-"));
   const target = join(base, "target"); // = cwd（审计根）
@@ -125,26 +132,38 @@ console.log("── 硬链接读逃逸（nlink 检测；覆盖裸文件名，对
   // cwd 外的秘密文件（同卷，才能建硬链接）
   const outsideSecret = join(base, "OUTSIDE_SECRET.txt");
   writeFileSync(outsideSecret, "HARDLINK-LEAK-SECRET");
-  // cwd 内硬链接 → 指向 cwd 外秘密（realpath 不解硬链接、沙箱按路径放行 → 旧洞可读出秘密）
+  // cwd 内硬链接 → 指向 cwd 外秘密（realpath 不解硬链接、沙箱按路径放行）
   const hlPath = join(target, "hl_secret");
-  const hlBareName = "hl_secret"; // 裸文件名参数（jail 的 looksPath 会漏，正是 PoC）
+  const hlBareName = "hl_secret"; // 裸文件名参数（原 PoC 场景）
   linkSync(outsideSecret, hlPath);
   // 正常文件（nlink=1）
   writeFileSync(join(target, "normal.txt"), "normal-ok");
   await (async () => {
     ok(statSync(hlPath).nlink > 1, `前置：硬链接 nlink=${statSync(hlPath).nlink}（>1）`);
-    // 1) 绝对路径硬链接被拒
+
+    // ── (甲) 默认行为：guard 关闭 ⇒ 不再因 nlink 拦截 ──────────────────
+    // ⚠️ 这正是被接受的风险：此路径下硬链接确实可读出 cwd 外内容。
+    //    依据见 checkPathJail 注释①②③（子 agent 只读且无 ln、单用户本机、误伤代价过大）。
     const rAbs = await runBashReadonly(`cat ${hlPath}`, target);
-    ok(rAbs.rejected === true && !rAbs.text.includes("HARDLINK-LEAK-SECRET"), `拒 cat <绝对硬链接>（未泄密）→ ${rAbs.reason ?? ""}`);
-    // 2) ★裸文件名硬链接被拒（PoC 场景：cat hl_secret）
+    ok(rAbs.rejected === false, `默认放行 cat <绝对硬链接>（guard 关，已知可接受风险）→ ${rAbs.reason ?? ""}`);
     const rBare = await runBashReadonly(`cat ${hlBareName}`, target);
-    ok(rBare.rejected === true && !rBare.text.includes("HARDLINK-LEAK-SECRET"), `拒 cat hl_secret（裸文件名，未泄密）→ ${rBare.reason ?? ""}`);
-    // 3) 裸文件名硬链接经其它读命令（stat/head/grep）也被拒
-    const rHead = await runBashReadonly("head hl_secret", target);
-    ok(rHead.rejected === true, "拒 head hl_secret（裸文件名硬链接）");
-    // 4) 正常文件（nlink=1）仍放行
+    ok(rBare.rejected === false, "默认放行 cat hl_secret（裸文件名，guard 关）");
+
+    // ── (乙) 显式开启 guard ⇒ 原防御完好，PoC 仍被拦 ────────────────────
+    // 直接调 checkPathJail（工具层不透传该选项，故在此单测保留证明）。
+    const gAbs = checkPathJail(["cat", hlPath], target, { hardlinkGuard: true });
+    ok(gAbs !== null && gAbs.includes("硬链接"), `guard 开：拒绝绝对硬链接 → ${gAbs ?? "(误放！)"}`);
+    const gBare = checkPathJail(["cat", hlBareName], target, { hardlinkGuard: true });
+    ok(gBare !== null && gBare.includes("硬链接"), `guard 开：拒绝裸文件名硬链接 → ${gBare ?? "(误放！)"}`);
+    const gHead = checkPathJail(["head", hlBareName], target, { hardlinkGuard: true });
+    ok(gHead !== null, "guard 开：head 裸文件名硬链接同样被拒");
+    // guard 开也不得误伤 nlink=1 的正常文件
+    const gNorm = checkPathJail(["cat", "normal.txt"], target, { hardlinkGuard: true });
+    ok(gNorm === null, "guard 开：nlink=1 正常文件不误伤");
+
+    // 4) 正常文件默认路径仍放行（回归）
     const rNorm = await runBashReadonly("cat normal.txt", target);
-    ok(rNorm.rejected === false && rNorm.text.includes("normal-ok"), "放行 cat normal.txt（nlink=1，不误伤）");
+    ok(rNorm.rejected === false && rNorm.text.includes("normal-ok"), "放行 cat normal.txt（不误伤）");
   })();
   rmSync(base, { recursive: true, force: true });
 }
