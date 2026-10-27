@@ -270,6 +270,16 @@ Release snapshots (with full source at each tag) are kept under the earlier
 [`pimoa-v2`](https://github.com/jerryxugit-2026/Ai-learning/releases/tag/pimoa-v2) ·
 [`pimoa-v1`](https://github.com/jerryxugit-2026/Ai-learning/releases/tag/pimoa-v1).
 
+## No real accounts, keys or passwords in this repository
+
+- Model providers are configured by **environment-variable names only** (`$DEEPSEEK_API_KEY`,
+  `$CLIPROXY_API_KEY`, …) in [`PiMoa/config/models.json`](PiMoa/config/models.json); there are no values.
+  OAuth-based providers keep their login in a local `auth.json` that is not part of this repository.
+- `jev-mcp` reads one key, `TYPESAFE_API_KEY`; the only file shipped is the **mock**
+  [`jev-mcp/secrets.env.example`](jev-mcp/secrets.env.example).
+- Tests that use credentials use obvious fakes (e.g. `sk-SECRET…` to prove the sandbox strips keys).
+- Every file was checked, value by value, against the real secret files on my machine before publishing.
+
 ## Honest limits, in one place
 
 - **This is a public learning and research release.** Test on copies of anything
@@ -310,6 +320,10 @@ physics, art history, AI tooling, and public systems.*
 [English](#build-agent-tools-pimoa) · **中文** · [`sheet_shadow`](./sheet_shadow) · [`PiMoa`](./PiMoa)
 
 ---
+
+## 本仓库不含任何真实账号、密钥或密码
+
+模型服务商只按**环境变量名**配置（如 `$DEEPSEEK_API_KEY`），没有任何值；OAuth 登录凭据存在本地 `auth.json`，不在仓库里。`jev-mcp` 只读取 `TYPESAFE_API_KEY` 一个密钥，仓库里只有 **mock** 文件 `jev-mcp/secrets.env.example`。测试里出现的密钥都是明显的假值（如用 `sk-SECRET…` 证明沙箱会剥掉密钥）。发布前每个文件都与本机真实密钥文件逐值比对过。
 
 ## 两个下午
 

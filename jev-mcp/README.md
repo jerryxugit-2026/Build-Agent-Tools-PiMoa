@@ -50,7 +50,7 @@ The model version is pinned (`jev-1.13.0`); the floating `latest` alias is refus
 
 ```bash
 go build -o jev-mcp ./cmd/jev-mcp
-echo 'TYPESAFE_API_KEY=...' > secrets.env        # or export TYPESAFE_API_KEY
+cp secrets.env.example secrets.env            # contains a MOCK key — put your own in
 JEV_MCP_TRANSPORT=http ./jev-mcp                  # shared instance on :8760, or stdio by default
 go test ./...
 ```
